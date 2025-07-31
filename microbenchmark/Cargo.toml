@@ -1,0 +1,22 @@
+[package]
+name = "io_microbenchmark"
+
+[[bin]]
+name = "microbench_sequential_read"
+path = "microbench_sequential_read.rs"
+
+[dependencies]
+io-uring = "0.6"
+libc = "0.2"
+pprof = { version = "0.14.0", features = ["flamegraph"] }
+clap = { version = "4.5.38", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true 
