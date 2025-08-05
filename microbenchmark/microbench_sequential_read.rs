@@ -8,14 +8,16 @@ extern crate pprof;
 extern crate clap;
 
 use std::fs::{File, OpenOptions};
+use std::os::raw::c_void;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 use std::alloc::{Layout, alloc};
+use io_uring::squeue::Entry;
 use io_uring::{cqueue, opcode, squeue, IoUring};
-use libc::posix_fadvise;
+use libc::{iovec, posix_fadvise};
 use pprof::ProfilerGuard;
 use std::sync::mpsc::{self, Receiver};
 use clap::Parser;
@@ -38,6 +40,8 @@ pub struct Cli {
     /// List of files to read
     #[arg(long, required = true)]
     pub files: String,
+    #[arg(long, default_value_t = false)]
+    pub use_fixed_buffers: bool,
 }
 
 fn start_flamegraph() -> ProfilerGuard<'static> {
@@ -75,19 +79,23 @@ fn main() {
         file_size: cli.file_size,
         chunk_size: cli.chunk_size,
         engine,
+        use_fixed_buffers: cli.use_fixed_buffers,
     };
     
     run_microbench(config);
 }
 
+#[derive(Clone)]
 pub struct MicrobenchConfig {
     pub files: Vec<PathBuf>,
     pub num_threads: usize,
     pub file_size: usize,
     pub chunk_size: usize,
     pub engine: IoEngine,
+    pub use_fixed_buffers: bool,
 }
 
+#[derive(Clone)]
 pub enum IoEngine {
     IoUring,
     PosixODirect,
@@ -95,7 +103,7 @@ pub enum IoEngine {
 
 pub fn run_microbench(config: MicrobenchConfig) {
     match config.engine {
-        IoEngine::IoUring => run_uring_bench(&config),
+        IoEngine::IoUring => run_uring_bench(config),
         IoEngine::PosixODirect => run_posix_odirect_bench(&config),
     }
 }
@@ -111,7 +119,7 @@ impl IoUringThreadpool {
     const NUM_ENTRIES: u32 = 4096;
     pub const BUFFER_ALIGNMENT: usize = 4096;
 
-    pub fn new(files_per_thread: &Vec<Vec<PathBuf>>, file_size: usize, chunk_size: usize) -> IoUringThreadpool {
+    pub fn new(files_per_thread: &Vec<Vec<PathBuf>>, config: MicrobenchConfig) -> IoUringThreadpool {
         let (tx, rx) = mpsc::channel();
         let mut workers = Vec::<thread::JoinHandle<()>>::new();
         let mut first_iter = true;
@@ -129,6 +137,7 @@ impl IoUringThreadpool {
             }
             let files = files.clone();
             let tx = tx.clone();
+            let config_clone = config.clone();
             let worker = thread::spawn(move || {
                 // let mut profiler: Option<ProfilerGuard<'static>> = None;
                 // if thread_id == 0 {
@@ -136,7 +145,7 @@ impl IoUringThreadpool {
                 //     profiler = Some(start_flamegraph());
                 // }
                 
-                let mut uring_worker = UringWorker::new(ring, files, file_size, chunk_size);
+                let mut uring_worker = UringWorker::new(ring, files, config_clone);
                 uring_worker.thread_loop();
                 let timings = uring_worker.get_timings().clone();
                 
@@ -153,7 +162,7 @@ impl IoUringThreadpool {
             workers.push(worker);
         }
         drop(tx);
-        IoUringThreadpool { workers, rx }
+        IoUringThreadpool { workers, rx}
     }
 }
 
@@ -163,37 +172,17 @@ pub struct IoTask {
     pub file: File,
 }
 
-fn create_io_task(file_path: &PathBuf, file_size: usize) -> IoTask {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(file_path)
-        .expect("Failed to open file with O_DIRECT");
-    let layout = Layout::from_size_align(file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
-    let base_ptr = unsafe { alloc(layout) };
-    unsafe {
-        let ret = posix_fadvise(file.as_raw_fd(), 0, file_size as i64, libc::POSIX_FADV_SEQUENTIAL);
-        assert_eq!(ret, 0, "posix_fadvise errored");
-    }
-    IoTask {
-        base_ptr,
-        num_bytes: file_size,
-        file,
-    }
-}
-
 struct UringWorker {
     ring: io_uring::IoUring,
     completions_array: Vec<usize>,
     tasks: Vec<Option<IoTask>>,
     file_paths: Vec<PathBuf>,
-    file_size: usize,
     timings: Vec<(Instant, Option<Instant>)>, // (submit_time, completion_time), indexed by file_idx
-    chunk_size: usize,
+    config: MicrobenchConfig,
 }
 
 impl UringWorker {
-    fn new(ring: io_uring::IoUring, file_paths: Vec<PathBuf>, file_size: usize, chunk_size: usize) -> UringWorker {
+    fn new(ring: io_uring::IoUring, file_paths: Vec<PathBuf>, config: MicrobenchConfig) -> UringWorker {
         let mut completions_array = Vec::<usize>::new();
         completions_array.resize(1<<16, 0);
         let tasks = Vec::<Option<IoTask>>::new();
@@ -204,16 +193,45 @@ impl UringWorker {
             completions_array,
             tasks,
             file_paths,
-            file_size,
             timings,
-            chunk_size,
+            config,
+        }
+    }
+
+    fn create_io_task(&mut self, file_path: &PathBuf) -> IoTask {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(file_path)
+            .expect("Failed to open file with O_DIRECT");
+        let layout = Layout::from_size_align(self.config.file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
+        let base_ptr = unsafe { alloc(layout) };
+        unsafe {
+            let ret = posix_fadvise(file.as_raw_fd(), 0, self.config.file_size as i64, libc::POSIX_FADV_SEQUENTIAL);
+            assert_eq!(ret, 0, "posix_fadvise errored");
+        }
+        IoTask {
+            base_ptr,
+            num_bytes: self.config.file_size,
+            file,
         }
     }
 
     fn create_io_tasks(&mut self) {
-        for file_path in self.file_paths.iter() {
-            let task = create_io_task(file_path, self.file_size);
+        let file_paths = self.file_paths.clone();
+        let mut iovecs = Vec::<libc::iovec>::new();
+        for file_path in file_paths.iter() {
+            let task = self.create_io_task(file_path);
+            iovecs.push(iovec {
+                iov_base: task.base_ptr as *mut c_void, 
+                iov_len: self.config.file_size
+            });
             self.tasks.push(Some(task));
+        }
+        if self.config.use_fixed_buffers {
+            unsafe {
+                let _ = self.ring.submitter().register_buffers(&iovecs);
+            }
         }
     }
 
@@ -246,7 +264,7 @@ impl UringWorker {
         let ring = &mut self.ring;
         let sq = &mut (ring.submission());
         let mut buf_ptr = task.base_ptr;
-        let num_chunks = (task.num_bytes + self.chunk_size - 1) / self.chunk_size;
+        let num_chunks = (task.num_bytes + self.config.chunk_size - 1) / self.config.chunk_size;
         sq.sync();
         let remaining = sq.capacity() - sq.len();
         if num_chunks > remaining {
@@ -254,21 +272,32 @@ impl UringWorker {
         }
         let user_data = (file_idx as u64)<<48;
         for i in 0..num_chunks {
-            // println!("{}", i);
-            let read_op = opcode::Read::new(
-                io_uring::types::Fd(task.file.as_raw_fd()),
-                buf_ptr,
-                self.chunk_size as _,
-            );
-            let sqe = read_op
-                .offset((i * self.chunk_size) as u64)
-                .build()
-                .user_data(user_data + i as u64);
+            let sqe: Entry;
+            if self.config.use_fixed_buffers {
+                let read_fixed_op = opcode::ReadFixed::new(
+                    io_uring::types::Fd(task.file.as_raw_fd()),
+                    task.base_ptr,
+                    self.config.chunk_size as _,
+                    file_idx as u16,
+                )
+                .offset((i * self.config.chunk_size) as u64);
+                sqe = read_fixed_op.build().user_data(user_data + i as u64);
+            } else {
+                let read_op = opcode::Read::new(
+                    io_uring::types::Fd(task.file.as_raw_fd()),
+                    buf_ptr,
+                    self.config.chunk_size as _,
+                );
+                sqe = read_op
+                    .offset((i * self.config.chunk_size) as u64)
+                    .build()
+                    .user_data(user_data + i as u64);
+            }
             unsafe {
                 while let Err(_) = sq.push(&sqe) {
                     sq.sync(); // Submit to kernel to make space
                 }
-                buf_ptr = buf_ptr.add(self.chunk_size);
+                buf_ptr = buf_ptr.add(self.config.chunk_size);
             }
         }
         sq.sync();
@@ -289,7 +318,7 @@ impl UringWorker {
                         print!("here\n");
                     }
                     assert!(
-                        cqe.result() == self.chunk_size as i32 || cqe.result() == 0,
+                        cqe.result() == self.config.chunk_size as i32 || cqe.result() == 0,
                         "Read cqe result error: {err}"
                     );
                     let opcode = (cqe.user_data()>>48) as usize;
@@ -316,11 +345,11 @@ impl UringWorker {
 
 
 /// Benchmark sequential read using io_uring (polled, kernel polling)
-pub fn run_uring_bench(config: &MicrobenchConfig) {
+pub fn run_uring_bench(config: MicrobenchConfig) {
     println!("Running io_uring sequential read benchmark with {} threads", config.num_threads);
     println!("File size: {}", config.file_size);
     let files_per_thread = split_files(&config.files, config.num_threads);
-    let mut threadpool = IoUringThreadpool::new(&files_per_thread, config.file_size, config.chunk_size);
+    let mut threadpool = IoUringThreadpool::new(&files_per_thread, config);
     for worker in threadpool.workers.drain(..) {
         let _ = worker.join();
     }

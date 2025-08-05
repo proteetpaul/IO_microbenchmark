@@ -63,6 +63,9 @@ BIO_PID=$!
 # Wait for 10 seconds to let the bio latency tool jit compilation finish
 sleep 10
 
+echo "Building microbenchmark"
+cargo build --release --bin microbench_sequential_read
+
 # Run the microbenchmark
 echo "Running microbenchmark..."
 # python3 parse_interrupts.py
@@ -80,7 +83,7 @@ MICROBENCH_PID=$!
 # Only benchmark kernel code, 1000 Hz, generate profile output in folded format for flamegraph generation
 # rm -f profile_output.txt
 echo "Starting profiler for PID $MICROBENCH_PID..."
-sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 > profile_output.txt &
+sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=20000 > profile_output.txt &
 PROFILE_PID=$!
 
 wait $MICROBENCH_PID
