@@ -79,21 +79,22 @@ MICROBENCH_PID=$!
 # PERF_PID=$!
 # Only benchmark kernel code, 1000 Hz, generate profile output in folded format for flamegraph generation
 # rm -f profile_output.txt
-# sudo /usr/sbin/profile-bpfcc -F 1000 -p $MICROBENCH_PID -K -f > profile_output.txt 2>&1 &
-# PROFILE_PID=$!
+echo "Starting profiler for PID $MICROBENCH_PID..."
+sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 > profile_output.txt &
+PROFILE_PID=$!
 
 wait $MICROBENCH_PID
 # python3 parse_interrupts.py
 
 echo "Microbenchmark completed... Stopping profiler and biosnoop..."
 sudo kill -SIGINT $BIO_PID
-# sudo kill -SIGINT $PROFILE_PID
-# sudo kill $PROFILE_PID
+sudo kill -SIGINT $PROFILE_PID
+wait $PROFILE_PID
 
-sync
+sync biosnoop.txt
 
 python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type block_device
 
-# /users/proteet/FlameGraph/flamegraph.pl --title="Flame Graph for IO" profile_output.txt > flamegraph.svg
+../FlameGraph/flamegraph.pl --title="Flame Graph for IO" profile_output.txt > flamegraph.svg
 echo "Done."
 # rm -rf "$DIR"/
