@@ -43,8 +43,6 @@ for i in $(seq 0 $((NUM_FILES-1))); do
   if [[ ! -f "$FILE" ]]; then
     echo "  Creating $FILE ..."
     fio --name=prep --filename="$FILE" --size="$FILE_SIZE" --rw=write --direct=1 --iodepth=1 --refill_buffers --randrepeat=0 --output=/dev/null &
-  else
-    echo "  $FILE already exists, skipping."
   fi
 done
 
@@ -57,7 +55,6 @@ for i in $(seq 0 $((NUM_FILES-1))); do
   FILE_LIST="$FILE_LIST $DIR/file${i}_${FILE_SIZE}.dat"
 done
 
-rm -f biosnoop.txt
 sudo /usr/sbin/biosnoop-bpfcc -Q > biosnoop.txt 2>&1 &
 BIO_PID=$!
 # Wait for 10 seconds to let the bio latency tool jit compilation finish
@@ -78,13 +75,15 @@ env RUST_LOG=info RUST_BACKTRACE=full cargo run --release --bin microbench_seque
   $EXTRA_ARGS &
 MICROBENCH_PID=$!
 
-# sudo perf record -e irq:irq_handler_entry -a &
-# PERF_PID=$!
 # Only benchmark kernel code, 1000 Hz, generate profile output in folded format for flamegraph generation
-# rm -f profile_output.txt
 echo "Starting profiler for PID $MICROBENCH_PID..."
-sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=20000 > profile_output.txt &
+sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=40000 > profile_output.txt &
+# profile-cache-misses-bpfcc uses the same logic as profile-bpfcc, except that it samples cache misses instead of the software timer
+# --count determines the sampling period (count=x means sample 1 out of x cache misses)
+sudo ./profile-cache-misses-bpfcc --count 1000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=40000 > cache_miss_output.txt &
 PROFILE_PID=$!
+sudo /usr/sbin/funclatency-bpfcc blk_mq_start_request --microseconds --pid $MICROBENCH_PID --duration 20 &
+FUNC_LATENCY_PID=$!
 
 wait $MICROBENCH_PID
 # python3 parse_interrupts.py
@@ -93,11 +92,13 @@ echo "Microbenchmark completed... Stopping profiler and biosnoop..."
 sudo kill -SIGINT $BIO_PID
 sudo kill -SIGINT $PROFILE_PID
 wait $PROFILE_PID
+wait $FUNC_LATENCY_PID
 
 sync biosnoop.txt
 
-python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type block_device
+python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type total
 
-../FlameGraph/flamegraph.pl --title="Flame Graph for IO" profile_output.txt > flamegraph.svg
+../FlameGraph/flamegraph.pl --title="Flame Graph for IO" profile_output.txt > flamegraph_128K.svg
+../FlameGraph/flamegraph.pl --title="Flame Graph for IO" cache_miss_output.txt > flamegraph_128K_cache.svg
 echo "Done."
 # rm -rf "$DIR"/

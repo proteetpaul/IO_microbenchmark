@@ -19,6 +19,7 @@ use io_uring::squeue::Entry;
 use io_uring::{cqueue, opcode, squeue, IoUring};
 use libc::{iovec, posix_fadvise};
 use pprof::ProfilerGuard;
+use std::sync::{Arc, Barrier};
 use std::sync::mpsc::{self, Receiver};
 use clap::Parser;
 
@@ -40,7 +41,7 @@ pub struct Cli {
     /// List of files to read
     #[arg(long, required = true)]
     pub files: String,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub use_fixed_buffers: bool,
 }
 
@@ -124,9 +125,10 @@ impl IoUringThreadpool {
         let mut workers = Vec::<thread::JoinHandle<()>>::new();
         let mut first_iter = true;
         let mut builder = IoUring::<squeue::Entry, cqueue::Entry>::builder();
-        // builder.setup_iopoll();
+        builder.setup_iopoll();
         builder.setup_sqpoll(50000);
-        builder.setup_sqpoll_cpu(12);
+        // builder.setup_sqpoll_cpu(12);
+        let barrier = Arc::new(Barrier::new(files_per_thread.len()));
         for (thread_id, files) in files_per_thread.iter().enumerate() {
             let ring = builder
                 .build(Self::NUM_ENTRIES)
@@ -138,25 +140,11 @@ impl IoUringThreadpool {
             let files = files.clone();
             let tx = tx.clone();
             let config_clone = config.clone();
-            let worker = thread::spawn(move || {
-                // let mut profiler: Option<ProfilerGuard<'static>> = None;
-                // if thread_id == 0 {
-                //     // Start per-thread flamegraph
-                //     profiler = Some(start_flamegraph());
-                // }
-                
+            let barrier_clone = barrier.clone();
+            let worker = thread::spawn(move || {                
                 let mut uring_worker = UringWorker::new(ring, files, config_clone);
-                uring_worker.thread_loop();
+                uring_worker.thread_loop(barrier_clone);
                 let timings = uring_worker.get_timings().clone();
-                
-                // if thread_id == 0{
-                //     // Stop flamegraph and save
-                //     let filename = format!("flamegraph_thread_{}.svg", thread_id);
-                //     if let Err(e) = stop_flamegraph(profiler.unwrap(), &filename) {
-                //         eprintln!("Failed to generate flamegraph for thread {}: {}", thread_id, e);
-                //     }
-                // }
-                
                 tx.send(timings).unwrap();
             });
             workers.push(worker);
@@ -235,11 +223,13 @@ impl UringWorker {
         }
     }
 
-    fn thread_loop(&mut self) {
+    fn thread_loop(&mut self, barrier: Arc<Barrier>) {
         let mut inflight = 0;
         let mut file_idx = 0;
         let num_files = self.file_paths.len();
         self.create_io_tasks();
+        // barrier.wait();
+        let start_time = Instant::now();
         while file_idx < num_files || inflight > 0 {
             // Submit next file if available
             if file_idx < num_files {
@@ -257,6 +247,8 @@ impl UringWorker {
 
             inflight -= completed;
         }
+        let end_time = Instant::now();
+        println!("Time taken: {}", (end_time-start_time).as_millis());
     }
 
     fn submit_reads(&mut self, file_idx: usize) -> usize {
@@ -319,7 +311,7 @@ impl UringWorker {
                     }
                     assert!(
                         cqe.result() == self.config.chunk_size as i32 || cqe.result() == 0,
-                        "Read cqe result error: {err}"
+                        "Read cqe result error: {}", err
                     );
                     let opcode = (cqe.user_data()>>48) as usize;
                     let remaining = &mut self.completions_array[opcode];
