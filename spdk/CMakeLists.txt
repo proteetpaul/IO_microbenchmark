@@ -7,10 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Always generate compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
-set(ENV{PKG_CONFIG_PATH} "/home/proteet/git_repos/spdk/build/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
-
 # Where to find SPDK installation (adjust path if you installed elsewhere)
-set(SPDK_DIR "~/git_repos/spdk")
+# Allow override via -DSPDK_DIR=...; default to $ENV{SPDK_DIR} or $ENV{HOME}/spdk
+set(SPDK_DIR "$ENV{SPDK_DIR}" CACHE PATH "Path to SPDK installation")
+if(SPDK_DIR STREQUAL "")
+    set(SPDK_DIR "$ENV{HOME}/spdk" CACHE PATH "Path to SPDK installation" FORCE)
+endif()
+set(ENV{PKG_CONFIG_PATH} "${SPDK_DIR}/build/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 
 # Add SPDK include directories
 include_directories(
@@ -36,7 +39,10 @@ execute_process(
 )
 separate_arguments(SPDK_SYS_LIBS NATIVE_COMMAND ${SPDK_SYS_LIBS})
 
-message(STATUS "The value of SPDK_NVME_LIBRARIES is: ${SPDK_NVME_LIBRARIES}")
-# Order matters here!!
-target_link_libraries(spdk_microbenchmark ${SPDK_NVME_LIBRARIES} ${SPDK_ENV_LIBRARIES} ${SPDK_SYS_LIBS})
+# Notes:
+# - Order of libraries matters here due to static linking
+# - See https://spdk.io/doc/pkgconfig.html on why -Wl,--whole-archive is needed
+target_link_libraries(spdk_microbenchmark 
+    -Wl,--whole-archive ${SPDK_NVME_LIBRARIES}  
+    -Wl,--no-whole-archive ${SPDK_ENV_LIBRARIES} ${SPDK_SYS_LIBS})
 # target_include_directories(spdk_microbenchmark PRIVATE ${SPDK_INCLUDE_DIRS})

@@ -239,17 +239,23 @@ void cleanup() {
 
 int main(int argc, char **argv) {
     int rc;
-    struct spdk_env_opts opts;
+    struct spdk_env_opts spdk_opts;
     Options cmd_opts = parse_args(argc, argv);    
     
     printf("Using transport ID: %s\n", cmd_opts.transport_id);
     
-    spdk_env_opts_init(&opts);
-    
+    spdk_opts.opts_size = sizeof(spdk_opts);
+    spdk_env_opts_init(&spdk_opts);
+
+    if (spdk_env_init(&spdk_opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
+		return 1;
+	}
+
     // Use the transport_id to connect to the specific PCIe device
-    struct spdk_nvme_transport_id tid = {};
-    tid.trtype = SPDK_NVME_TRANSPORT_PCIE;
-    tid.adrfam = SPDK_NVMF_ADRFAM_INTRA_HOST;
+    struct spdk_nvme_transport_id tid;
+    spdk_nvme_trid_populate_transport(&tid, SPDK_NVME_TRANSPORT_PCIE);
+	snprintf(tid.subnqn, sizeof(tid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
     snprintf(tid.traddr, sizeof(tid.traddr), "%s", cmd_opts.transport_id);
 
     if (spdk_nvme_probe(&tid, NULL, probe_cb, attach_cb, NULL) < 0) {
