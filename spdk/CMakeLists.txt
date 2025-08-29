@@ -19,6 +19,7 @@ set(ENV{PKG_CONFIG_PATH} "${SPDK_DIR}/build/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}"
 include_directories(
     ${SPDK_DIR}/include
     ${SPDK_DIR}/include/spdk
+    ${SPDK_DIR}/dpdk/build/include
     /usr/include/c++/11
 )
 
