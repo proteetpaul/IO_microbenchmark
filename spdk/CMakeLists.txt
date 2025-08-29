@@ -42,8 +42,8 @@ separate_arguments(SPDK_SYS_LIBS NATIVE_COMMAND ${SPDK_SYS_LIBS})
 
 # Notes:
 # - Order of libraries matters here due to static linking
-# - See https://spdk.io/doc/pkgconfig.html on why -Wl,--whole-archive is needed
+# - See https://spdk.io/doc/pkgconfig.html on why --whole-archive and --no-as-needed linker flags are required
 target_link_libraries(spdk_microbenchmark 
     -Wl,--whole-archive ${SPDK_NVME_LIBRARIES}  
-    -Wl,--no-whole-archive ${SPDK_ENV_LIBRARIES} ${SPDK_SYS_LIBS})
-# target_include_directories(spdk_microbenchmark PRIVATE ${SPDK_INCLUDE_DIRS})
+    -Wl,--no-whole-archive -Wl,--no-as-needed ${SPDK_ENV_LIBRARIES} 
+    -Wl,--as-needed ${SPDK_SYS_LIBS})
