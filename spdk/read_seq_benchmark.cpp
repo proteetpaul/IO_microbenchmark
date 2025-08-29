@@ -1,8 +1,10 @@
 #include "nvme_spec.h"
+#include <cstddef>
 #include <getopt.h>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
 #include <spdk/string.h>
+#include <spdk/log.h>
 #include <rte_errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,6 +19,7 @@
 #include <algorithm>
 #include <system_error>
 #include <cmath>
+#include <rte_log.h>
 
 struct Options {
     char *transport_id;
@@ -40,11 +43,6 @@ struct IOTrace {
     uint64_t duration_us;
 };
 
-struct spdk_read_cb_args {
-    IOTrace *trace;
-    uint32_t *completed;
-};
-
 static ControllerInfo global_controller_info = {
     .ns = NULL, 
     .controller = NULL,
@@ -57,12 +55,14 @@ static const uint32_t ALIGNMENT = 4096;
 
 void read_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
-	spdk_read_cb_args *args = (spdk_read_cb_args*)arg;
-    uint32_t &completed = *args->completed;
-    completed++;
-    args->trace->end = std::chrono::system_clock::now();
-	args->trace->duration_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-		args->trace->end - args->trace->start
+    if (spdk_nvme_cpl_is_error(completion)) {
+        printf("Completion error: %s", spdk_nvme_cpl_get_status_string(&completion->status));
+    }
+
+	IOTrace *trace = (IOTrace*)arg;
+    trace->end = std::chrono::system_clock::now();
+	trace->duration_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+		trace->end - trace->start
 	).count();
 }
 
@@ -88,7 +88,6 @@ std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t threa
         &qpair_opts,
         sizeof(struct spdk_nvme_io_qpair_opts)
     );
-    printf("Thread %d initialized its queue pair\n", thread_id);
     if (qpair == NULL) {
         printf("Failed to create queue pair\n");
         exit(1);
@@ -99,23 +98,20 @@ std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t threa
     uint32_t completed = 0;
     std::vector<IOTrace> traces(total_submissions);
 
-    std::vector<spdk_read_cb_args> callback_args;
     while (num_submissions < total_submissions) {
         traces[num_submissions].start = std::chrono::system_clock::now();
         void *payload = spdk_mempool_get(mempool);
-        spdk_read_cb_args cb_args = {
-            .trace = &traces[num_submissions],
-            .completed = &completed,
-        };
-        callback_args.push_back(cb_args);
-        // printf("Submitting read command\n");
-        spdk_nvme_ns_cmd_read(global_controller_info.ns, qpair, payload, current_lba, lba_count, read_complete, (void*)(&callback_args[num_submissions]), 0);
+        if (payload == NULL) {
+            printf("Mempool returned NULL\n");
+            break;
+        }
+        spdk_nvme_ns_cmd_read(global_controller_info.ns, qpair, payload, current_lba, lba_count, read_complete, (void*)(&traces[num_submissions]), 0);
         num_submissions++;
         current_lba += transfers_per_file;
     }
 
-    while (completed < total_submissions) {
-        spdk_nvme_qpair_process_completions(qpair, 0);
+    while (completed < num_submissions) {
+        completed += spdk_nvme_qpair_process_completions(qpair, 0);
     }
     spdk_nvme_ctrlr_free_io_qpair(qpair);
     return traces;
@@ -263,7 +259,7 @@ void cleanup() {
 int main(int argc, char **argv) {
     int rc;
     struct spdk_env_opts spdk_opts;
-    Options cmd_opts = parse_args(argc, argv);    
+    Options cmd_opts = parse_args(argc, argv);
     
     printf("Using transport ID: %s\n", cmd_opts.transport_id);
     
@@ -274,6 +270,9 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
 	}
+    // Enable debug logs
+    spdk_log_set_level(SPDK_LOG_DEBUG);
+    rte_log_set_global_level(RTE_LOG_DEBUG);
 
     // Use the transport_id to connect to the specific PCIe device
     struct spdk_nvme_transport_id tid;
@@ -285,9 +284,13 @@ int main(int argc, char **argv) {
         printf("spdk_nvme_probe failed.\n");
         return 1;
     }
-    printf("Num files: %d\nFile size: %d\nNum threads: %d\n", cmd_opts.num_files, cmd_opts.file_size_bytes, cmd_opts.num_threads);
+    printf("Num files: %d\nFile size: %ld\nNum threads: %d\n", cmd_opts.num_files, cmd_opts.file_size_bytes, cmd_opts.num_threads);
     // Pre-allocate memory in a pool
-    mempool = spdk_mempool_create("benchmarking", cmd_opts.num_files, cmd_opts.file_size_bytes, 0, SPDK_ENV_NUMA_ID_ANY);
+    uint32_t cache_size = 0;
+    if (cmd_opts.num_threads > 1) {
+        cache_size = cmd_opts.num_files / cmd_opts.num_threads;
+    }
+    mempool = spdk_mempool_create("benchmarking", cmd_opts.num_files, cmd_opts.file_size_bytes, cache_size, SPDK_ENV_NUMA_ID_ANY);
     if (mempool == NULL) {
         std::error_code ec(rte_errno, std::generic_category());
         printf("Failed to create SPDK mempool: %d\n", rte_errno);
@@ -327,10 +330,9 @@ int main(int argc, char **argv) {
     uint64_t p90 = pct(90.0);
     uint64_t p99 = pct(99.0);
 
-    printf("Latency percentiles (microseconds): p50=%lu, p70=%lu, p90=%lu, p99=%lu\n",
+    printf("Latency percentiles (microseconds):\np50=%lu\n p70=%lu\n p90=%lu\n p99=%lu\n",
            (unsigned long)p50, (unsigned long)p70, (unsigned long)p90, (unsigned long)p99);
 
     cleanup();
-    printf("Exiting...\n");
     return 0;
 }

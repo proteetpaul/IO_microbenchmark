@@ -47,3 +47,5 @@ target_link_libraries(spdk_microbenchmark
     -Wl,--whole-archive ${SPDK_NVME_LIBRARIES}  
     -Wl,--no-whole-archive -Wl,--no-as-needed ${SPDK_ENV_LIBRARIES} 
     -Wl,--as-needed ${SPDK_SYS_LIBS})
+
+target_compile_options(spdk_microbenchmark PRIVATE -g)

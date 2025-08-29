@@ -21,7 +21,7 @@ NUM_FILES=""
 FILE_SIZE=""
 PROFILER="record"
 PERF_OUT="perf.data"
-FLAMEGRAPH_DIR="./Flamegraph"
+FLAMEGRAPH_DIR="../FlameGraph"
 FLAMEGRAPH_OUT="flamegraph.svg"
 
 while getopts ":C:t:n:f:s:p:o:G:O:h" opt; do
@@ -67,9 +67,7 @@ case "$PROFILER" in
   record)
     perf record -F 10000 --call-graph dwarf -o "$PERF_OUT" -- "${CMD[@]}"
     status=$?
-    if [[ $status -ne 0 ]]; then
-      exit $status
-    fi
+
     if [[ ! -f "$PERF_OUT" ]]; then
       echo "Warning: perf output '$PERF_OUT' not found; skipping flamegraph." >&2
       exit 0
