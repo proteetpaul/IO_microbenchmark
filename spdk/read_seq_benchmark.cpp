@@ -1,5 +1,7 @@
 #include "nvme_spec.h"
+#include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <getopt.h>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -11,15 +13,22 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <iostream>
 #include <vector>
 #include <chrono>
-#include <thread>
+#include <pthread.h>
+#include <sched.h>
 #include <future>
 #include <algorithm>
 #include <system_error>
 #include <cmath>
 #include <rte_log.h>
+
+/**
+TODO():
+- Fix bug where SPDK is unable to create mempool for large number of files
+- Investigate why submission queue size is halved
+- Investigate why threads are launched on the same core
+*/
 
 struct Options {
     char *transport_id;
@@ -66,7 +75,14 @@ void read_complete(void *arg, const struct spdk_nvme_cpl *completion)
 	).count();
 }
 
-std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t thread_id) {
+std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t thread_id, pthread_barrier_t *start_point) {
+    int cpuid = sched_getcpu();
+    printf("Thread %d running on cpu %d\n", thread_id, cpuid);
+    // Set thread name (useful for investigating flamegraphs)
+    char thread_name[20];
+    snprintf(thread_name, 20, "spdk-worker-%d", thread_id);
+    pthread_setname_np(pthread_self(), thread_name);
+
     uint32_t num_files_per_thread = opts->num_files / opts->num_threads;
     uint32_t transfers_per_file = std::max(1ul, opts->file_size_bytes / global_controller_info.max_io_xfer_size);
     uint32_t lba_count = std::min(global_controller_info.max_io_xfer_size, opts->file_size_bytes) / global_controller_info.sector_size;
@@ -97,23 +113,47 @@ std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t threa
     uint32_t num_submissions = 0;
     uint32_t completed = 0;
     std::vector<IOTrace> traces(total_submissions);
+    bool should_terminate = false;
+    pthread_barrier_wait(start_point);
 
-    while (num_submissions < total_submissions) {
-        traces[num_submissions].start = std::chrono::system_clock::now();
-        void *payload = spdk_mempool_get(mempool);
-        if (payload == NULL) {
-            printf("Mempool returned NULL\n");
-            break;
+    auto start_time = std::chrono::system_clock::now();
+    bool resubmit = false;
+    void *payload = NULL;
+
+    while (!should_terminate) {
+        while (num_submissions < total_submissions) {
+            if (!resubmit) {
+                payload = spdk_mempool_get(mempool);
+                if (payload == NULL) {
+                    printf("Mempool returned NULL\n");
+                    should_terminate = true;
+                    break;
+                }
+            }
+            int ret = spdk_nvme_ns_cmd_read(global_controller_info.ns, qpair, payload, 
+                current_lba, lba_count, read_complete, (void*)(&traces[num_submissions]), 0);
+            if (ret == -ENOMEM) {
+                // Submission queue is full. Poll for completions
+                resubmit = true;
+                break;
+            }
+            traces[num_submissions].start = std::chrono::system_clock::now();
+            num_submissions++;
+            current_lba += transfers_per_file;
         }
-        spdk_nvme_ns_cmd_read(global_controller_info.ns, qpair, payload, current_lba, lba_count, read_complete, (void*)(&traces[num_submissions]), 0);
-        num_submissions++;
-        current_lba += transfers_per_file;
+
+        completed += spdk_nvme_qpair_process_completions(qpair, 0);
+        should_terminate |= (completed == total_submissions);
     }
 
-    while (completed < num_submissions) {
-        completed += spdk_nvme_qpair_process_completions(qpair, 0);
-    }
+    auto end_time = std::chrono::system_clock::now();
+    auto duration = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+		end_time - start_time
+	).count();
+
     spdk_nvme_ctrlr_free_io_qpair(qpair);
+
+    printf("Thread %d took %ld ms\n", thread_id, duration);
     return traces;
 }
 
@@ -297,11 +337,14 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    pthread_barrier_t start_barrier;
+    pthread_barrier_init(&start_barrier, NULL, cmd_opts.num_threads);
+
     // Run per-thread benchmarks and collect IO traces
     std::vector<std::future<std::vector<IOTrace>>> futures;
     futures.reserve(cmd_opts.num_threads);
     for (uint32_t i = 0; i < cmd_opts.num_threads; i++) {
-        futures.emplace_back(std::async(std::launch::async, run_single_threaded_benchmark, &cmd_opts, i));
+        futures.emplace_back(std::async(std::launch::async, run_single_threaded_benchmark, &cmd_opts, i, &start_barrier));
     }
 
     std::vector<IOTrace> all_traces;

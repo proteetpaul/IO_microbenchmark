@@ -3,9 +3,11 @@ project(spdk_microbenchmark CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Always generate compile_commands.json
+# Aside: Setup clangd as follows:
+# - compile-commands-dir -> build directory
+# - query-drivers -> system compiler path
+# Always generate compile_commands.json for clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 # Where to find SPDK installation (adjust path if you installed elsewhere)
 # Allow override via -DSPDK_DIR=...; default to $ENV{SPDK_DIR} or $ENV{HOME}/spdk
@@ -20,7 +22,7 @@ include_directories(
     ${SPDK_DIR}/include
     ${SPDK_DIR}/include/spdk
     ${SPDK_DIR}/dpdk/build/include
-    /usr/include/c++/11
+    # /usr/include/c++/13
 )
 
 # Find libraries inside SPDK build
