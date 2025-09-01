@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <getopt.h>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -11,59 +12,74 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 #include <string.h>
 #include <vector>
 #include <chrono>
 #include <pthread.h>
 #include <sched.h>
-#include <future>
 #include <algorithm>
 #include <system_error>
 #include <cmath>
 #include <rte_log.h>
 
+#define CACHE_LINE_SIZE 64
+
 /**
 TODO():
-- Fix bug where SPDK is unable to create mempool for large number of files
-- Investigate why submission queue size is halved
 - Investigate why threads are launched on the same core
 */
 
-struct Options {
-    char *transport_id;
-    uint32_t num_threads;
-    uint32_t num_files;
-    uint64_t file_size_bytes;
-};
-
 struct ControllerInfo {
     struct spdk_nvme_ns *ns;
+
     struct spdk_nvme_ctrlr *controller;
+    
     const struct spdk_nvme_ctrlr_data *controller_data;
+    
     size_t max_io_xfer_size;
+    
     uint32_t mqe; // Maximum queue entries
+    
     size_t sector_size;
 };
 
 struct IOTrace {
     std::chrono::time_point<std::chrono::system_clock> start;
+
     std::chrono::time_point<std::chrono::system_clock> end;
+    
     uint64_t duration_us;
 };
 
-static ControllerInfo global_controller_info = {
-    .ns = NULL, 
-    .controller = NULL,
-    .controller_data = NULL,
-};
+
+struct Options {
+    char *transport_id;
+    
+    uint32_t num_threads;
+    
+    uint32_t num_files;
+    
+    uint64_t file_size_bytes;
+
+    ControllerInfo controller_info;
+
+    uint32_t transfers_per_file() {
+        return std::max(1ul, file_size_bytes / controller_info.max_io_xfer_size);
+    }
+
+    uint32_t lba_per_transfer() {
+        return std::min(controller_info.max_io_xfer_size, file_size_bytes) / controller_info.sector_size;
+    }
+} __attribute__((aligned(CACHE_LINE_SIZE)));
 
 struct spdk_mempool *mempool;
 
 static const uint32_t ALIGNMENT = 4096;
 
-void read_complete(void *arg, const struct spdk_nvme_cpl *completion)
-{
+void read_complete(void *arg, const struct spdk_nvme_cpl *completion) {
     if (spdk_nvme_cpl_is_error(completion)) {
         printf("Completion error: %s", spdk_nvme_cpl_get_status_string(&completion->status));
     }
@@ -75,32 +91,34 @@ void read_complete(void *arg, const struct spdk_nvme_cpl *completion)
 	).count();
 }
 
-std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t thread_id, pthread_barrier_t *start_point) {
+void run_single_threaded_benchmark(Options *opts, uint32_t thread_id, 
+        pthread_barrier_t *start_point, IOTrace *traces) {
     int cpuid = sched_getcpu();
     printf("Thread %d running on cpu %d\n", thread_id, cpuid);
-    // Set thread name (useful for investigating flamegraphs)
+
     char thread_name[20];
     snprintf(thread_name, 20, "spdk-worker-%d", thread_id);
     pthread_setname_np(pthread_self(), thread_name);
 
     uint32_t num_files_per_thread = opts->num_files / opts->num_threads;
-    uint32_t transfers_per_file = std::max(1ul, opts->file_size_bytes / global_controller_info.max_io_xfer_size);
-    uint32_t lba_count = std::min(global_controller_info.max_io_xfer_size, opts->file_size_bytes) / global_controller_info.sector_size;
+    uint32_t transfers_per_file = opts->transfers_per_file();
+    uint32_t lba_count = opts->lba_per_transfer();
 
     uint32_t total_submissions = num_files_per_thread * transfers_per_file;
     uint64_t lba_start = thread_id * total_submissions;
+    auto controller_info = opts->controller_info;
     // create queue pair
     struct spdk_nvme_io_qpair_opts qpair_opts;
-    spdk_nvme_ctrlr_get_default_io_qpair_opts(global_controller_info.controller, 
+    spdk_nvme_ctrlr_get_default_io_qpair_opts(controller_info.controller, 
         &qpair_opts,
         sizeof(struct spdk_nvme_io_qpair_opts)
     );
 
     // Set capacity of IO queues to max possible value (default is 1024)
-    qpair_opts.io_queue_size = global_controller_info.mqe + 1;
+    qpair_opts.io_queue_size = controller_info.mqe + 1;
 
     struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(
-        global_controller_info.controller,
+        controller_info.controller,
         &qpair_opts,
         sizeof(struct spdk_nvme_io_qpair_opts)
     );
@@ -112,7 +130,6 @@ std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t threa
     uint64_t current_lba = lba_start;
     uint32_t num_submissions = 0;
     uint32_t completed = 0;
-    std::vector<IOTrace> traces(total_submissions);
     bool should_terminate = false;
     pthread_barrier_wait(start_point);
 
@@ -130,7 +147,7 @@ std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t threa
                     break;
                 }
             }
-            int ret = spdk_nvme_ns_cmd_read(global_controller_info.ns, qpair, payload, 
+            int ret = spdk_nvme_ns_cmd_read(controller_info.ns, qpair, payload, 
                 current_lba, lba_count, read_complete, (void*)(&traces[num_submissions]), 0);
             if (ret == -ENOMEM) {
                 // Submission queue is full. Poll for completions
@@ -154,7 +171,6 @@ std::vector<IOTrace> run_single_threaded_benchmark(Options *opts, uint32_t threa
     spdk_nvme_ctrlr_free_io_qpair(qpair);
 
     printf("Thread %d took %ld ms\n", thread_id, duration);
-    return traces;
 }
 
 static uint64_t parse_iec_size(const char *text)
@@ -260,25 +276,28 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
-	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *spdk_ctrlr_opts)
 {
+    Options *opts = (Options*) cb_ctx;
+    ControllerInfo *controller_info = (ControllerInfo *) aligned_alloc(CACHE_LINE_SIZE, sizeof(ControllerInfo));
+
 	int nsid;
 	struct spdk_nvme_ns *ns;
 	printf("Attached to %s\n", trid->traddr);
 
-	global_controller_info.controller_data = spdk_nvme_ctrlr_get_data(ctrlr);
-    global_controller_info.controller = ctrlr;
+	opts->controller_info.controller_data = spdk_nvme_ctrlr_get_data(ctrlr);
+    opts->controller_info.controller = ctrlr;
 	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr); nsid != 0;
 	     nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
 		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 		if (ns == NULL) {
 			continue;
 		}
-		global_controller_info.ns = ns;
-        global_controller_info.max_io_xfer_size = spdk_nvme_ns_get_max_io_xfer_size(ns);
-        global_controller_info.sector_size = spdk_nvme_ns_get_sector_size(ns);
+		opts->controller_info.ns = ns;
+        opts->controller_info.max_io_xfer_size = spdk_nvme_ns_get_max_io_xfer_size(ns);
+        opts->controller_info.sector_size = spdk_nvme_ns_get_sector_size(ns);
         union spdk_nvme_cap_register cap_reg = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
-        global_controller_info.mqe = cap_reg.bits.mqes;
+        opts->controller_info.mqe = cap_reg.bits.mqes;
 
         printf("======Controller Information======\n");
         printf("Namespace ID: %d\nSize: %ju GB\nMQE: %d\nMax IO transfer size: %d KB\n", spdk_nvme_ns_get_id(ns),
@@ -291,74 +310,12 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	}
 }
 
-void cleanup() {
+void cleanup(Options *opts) {
     spdk_mempool_free(mempool);
-    spdk_nvme_detach(global_controller_info.controller);
+    spdk_nvme_detach(opts->controller_info.controller);
 }
 
-int main(int argc, char **argv) {
-    int rc;
-    struct spdk_env_opts spdk_opts;
-    Options cmd_opts = parse_args(argc, argv);
-    
-    printf("Using transport ID: %s\n", cmd_opts.transport_id);
-    
-    spdk_opts.opts_size = sizeof(spdk_opts);
-    spdk_env_opts_init(&spdk_opts);
-
-    if (spdk_env_init(&spdk_opts) < 0) {
-		fprintf(stderr, "Unable to initialize SPDK env\n");
-		return 1;
-	}
-    // Enable debug logs
-    spdk_log_set_level(SPDK_LOG_DEBUG);
-    rte_log_set_global_level(RTE_LOG_DEBUG);
-
-    // Use the transport_id to connect to the specific PCIe device
-    struct spdk_nvme_transport_id tid;
-    spdk_nvme_trid_populate_transport(&tid, SPDK_NVME_TRANSPORT_PCIE);
-	snprintf(tid.subnqn, sizeof(tid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
-    snprintf(tid.traddr, sizeof(tid.traddr), "%s", cmd_opts.transport_id);
-
-    if (spdk_nvme_probe(&tid, NULL, probe_cb, attach_cb, NULL) < 0) {
-        printf("spdk_nvme_probe failed.\n");
-        return 1;
-    }
-    printf("Num files: %d\nFile size: %ld\nNum threads: %d\n", cmd_opts.num_files, cmd_opts.file_size_bytes, cmd_opts.num_threads);
-    // Pre-allocate memory in a pool
-    uint32_t cache_size = 0;
-    if (cmd_opts.num_threads > 1) {
-        cache_size = cmd_opts.num_files / cmd_opts.num_threads;
-    }
-    mempool = spdk_mempool_create("benchmarking", cmd_opts.num_files, cmd_opts.file_size_bytes, cache_size, SPDK_ENV_NUMA_ID_ANY);
-    if (mempool == NULL) {
-        std::error_code ec(rte_errno, std::generic_category());
-        printf("Failed to create SPDK mempool: %d\n", rte_errno);
-        exit(1);
-    }
-
-    pthread_barrier_t start_barrier;
-    pthread_barrier_init(&start_barrier, NULL, cmd_opts.num_threads);
-
-    // Run per-thread benchmarks and collect IO traces
-    std::vector<std::future<std::vector<IOTrace>>> futures;
-    futures.reserve(cmd_opts.num_threads);
-    for (uint32_t i = 0; i < cmd_opts.num_threads; i++) {
-        futures.emplace_back(std::async(std::launch::async, run_single_threaded_benchmark, &cmd_opts, i, &start_barrier));
-    }
-
-    std::vector<IOTrace> all_traces;
-    for (auto &f : futures) {
-        std::vector<IOTrace> t = f.get();
-        all_traces.insert(all_traces.end(), t.begin(), t.end());
-    }
-    
-    // Compute percentiles on duration_us
-    std::vector<uint64_t> durations;
-    durations.reserve(all_traces.size());
-    for (const auto &tr : all_traces) {
-        durations.push_back(tr.duration_us);
-    }
+void print_percentiles(std::vector<uint64_t> &durations) {
     std::sort(durations.begin(), durations.end());
     auto pct = [&](double p) -> uint64_t {
         if (durations.empty()) return 0;
@@ -375,7 +332,89 @@ int main(int argc, char **argv) {
 
     printf("Latency percentiles (microseconds):\np50=%lu\n p70=%lu\n p90=%lu\n p99=%lu\n",
            (unsigned long)p50, (unsigned long)p70, (unsigned long)p90, (unsigned long)p99);
+}
 
-    cleanup();
+void run_benchmark(Options *app_opts) {
+    uint32_t num_threads = app_opts->num_threads;
+    pthread_barrier_t start_barrier;
+    pthread_barrier_init(&start_barrier, NULL, num_threads);
+    
+    uint32_t submissions_per_thread = app_opts->transfers_per_file() * app_opts->num_files / num_threads;
+    uint64_t trace_chunk_size = sizeof(struct IOTrace) * submissions_per_thread;
+    uint64_t padding = CACHE_LINE_SIZE - trace_chunk_size % CACHE_LINE_SIZE;
+    trace_chunk_size += padding;
+    std::vector<IOTrace*> trace_array_ptrs(num_threads);
+
+    for (int i=0; i<num_threads; i++) {
+        trace_array_ptrs[i] = (IOTrace *) aligned_alloc(CACHE_LINE_SIZE, trace_chunk_size * num_threads);
+    }
+
+    std::vector<std::thread> futures;
+    for (uint32_t i = 0; i < num_threads; i++) {
+        std::thread future(run_single_threaded_benchmark, app_opts, i, &start_barrier, trace_array_ptrs[i]);
+        futures.push_back(std::move(future));
+    }
+
+    for (uint32_t i = 0; i < num_threads; i++) {
+        futures[i].join();
+    }
+    
+    // Compute percentiles on duration_us
+    std::vector<uint64_t> durations;
+    durations.reserve(submissions_per_thread * num_threads);
+    uint32_t offset = 0;
+    for (int i=0; i<num_threads; i++) {
+        for (int j=0; j<submissions_per_thread; j++) {
+            durations.push_back(trace_array_ptrs[i][j].duration_us);
+        }
+    }
+
+    print_percentiles(durations);
+}
+
+int main(int argc, char **argv) {
+    int rc;
+    struct spdk_env_opts spdk_opts;
+    Options app_opts = parse_args(argc, argv);
+    
+    printf("Using transport ID: %s\n", app_opts.transport_id);
+    
+    spdk_opts.opts_size = sizeof(spdk_opts);
+    spdk_env_opts_init(&spdk_opts);
+
+    if (spdk_env_init(&spdk_opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
+		return 1;
+	}
+    // Enable debug logs
+    spdk_log_set_level(SPDK_LOG_DEBUG);
+    rte_log_set_global_level(RTE_LOG_DEBUG);
+
+    // Use the transport_id to connect to the specific PCIe device
+    struct spdk_nvme_transport_id tid;
+    spdk_nvme_trid_populate_transport(&tid, SPDK_NVME_TRANSPORT_PCIE);
+	snprintf(tid.subnqn, sizeof(tid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
+    snprintf(tid.traddr, sizeof(tid.traddr), "%s", app_opts.transport_id);
+
+    if (spdk_nvme_probe(&tid, (void*)&app_opts, probe_cb, attach_cb, NULL) < 0) {
+        printf("spdk_nvme_probe failed.\n");
+        return 1;
+    }
+    printf("Num files: %d\nFile size: %ld\nNum threads: %d\n", app_opts.num_files, app_opts.file_size_bytes, app_opts.num_threads);
+    // Pre-allocate memory in a pool
+    uint32_t cache_size = 0;
+    if (app_opts.num_threads > 1) {
+        cache_size = app_opts.num_files / app_opts.num_threads;
+    }
+    mempool = spdk_mempool_create("benchmarking", app_opts.num_files, app_opts.file_size_bytes, cache_size, SPDK_ENV_NUMA_ID_ANY);
+    if (mempool == NULL) {
+        std::error_code ec(rte_errno, std::generic_category());
+        printf("Failed to create SPDK mempool: %d\n", rte_errno);
+        exit(1);
+    }
+
+    run_benchmark(&app_opts);
+
+    cleanup(&app_opts);
     return 0;
 }
