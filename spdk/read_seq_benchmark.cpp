@@ -13,8 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
+#include <sched.h>
 #include <string.h>
 #include <vector>
 #include <chrono>
@@ -24,6 +24,8 @@
 #include <system_error>
 #include <cmath>
 #include <rte_log.h>
+#include <tuple>
+#include <atomic>
 
 #define CACHE_LINE_SIZE 64
 
@@ -325,12 +327,12 @@ void print_percentiles(std::vector<uint64_t> &durations) {
         return durations[idx];
     };
 
-    uint64_t p50 = pct(50.0);
-    uint64_t p70 = pct(70.0);
-    uint64_t p90 = pct(90.0);
-    uint64_t p99 = pct(99.0);
+    uint64_t p50 = pct(50.0)/1000;
+    uint64_t p70 = pct(70.0)/1000;
+    uint64_t p90 = pct(90.0)/1000;
+    uint64_t p99 = pct(99.0)/1000;
 
-    printf("Latency percentiles (microseconds):\np50=%lu\n p70=%lu\n p90=%lu\n p99=%lu\n",
+    printf("Latency percentiles (milliseconds):\np50=%lu\n p70=%lu\n p90=%lu\n p99=%lu\n",
            (unsigned long)p50, (unsigned long)p70, (unsigned long)p90, (unsigned long)p99);
 }
 
@@ -338,6 +340,13 @@ void run_benchmark(Options *app_opts) {
     uint32_t num_threads = app_opts->num_threads;
     pthread_barrier_t start_barrier;
     pthread_barrier_init(&start_barrier, NULL, num_threads);
+    
+    // Create CPU masks for each thread to ensure they run on different cores
+    std::vector<cpu_set_t> cpu_masks(num_threads);
+    for (uint32_t i = 0; i < num_threads; i++) {
+        CPU_ZERO(&cpu_masks[i]);
+        CPU_SET(i, &cpu_masks[i]);  // Assign thread i to CPU core i
+    }
     
     uint32_t submissions_per_thread = app_opts->transfers_per_file() * app_opts->num_files / num_threads;
     uint64_t trace_chunk_size = sizeof(struct IOTrace) * submissions_per_thread;
@@ -349,14 +358,28 @@ void run_benchmark(Options *app_opts) {
         trace_array_ptrs[i] = (IOTrace *) aligned_alloc(CACHE_LINE_SIZE, trace_chunk_size * num_threads);
     }
 
-    std::vector<std::thread> futures;
+    std::vector<pthread_t> threads(num_threads);
+    std::vector<pthread_attr_t> thread_attrs(num_threads);
+    
     for (uint32_t i = 0; i < num_threads; i++) {
-        std::thread future(run_single_threaded_benchmark, app_opts, i, &start_barrier, trace_array_ptrs[i]);
-        futures.push_back(std::move(future));
+        pthread_attr_init(&thread_attrs[i]);
+        pthread_attr_setaffinity_np(&thread_attrs[i], sizeof(cpu_set_t), &cpu_masks[i]);
+        
+        pthread_create(&threads[i], &thread_attrs[i], 
+            [](void *arg) -> void* {
+                auto *args = static_cast<std::tuple<Options*, uint32_t, pthread_barrier_t*, IOTrace*>*>(arg);
+                run_single_threaded_benchmark(std::get<0>(*args), std::get<1>(*args), 
+                                            std::get<2>(*args), std::get<3>(*args));
+                delete args;
+                return NULL;
+            },
+            new std::tuple<Options*, uint32_t, pthread_barrier_t*, IOTrace*>(app_opts, i, &start_barrier, trace_array_ptrs[i])
+        );
     }
 
     for (uint32_t i = 0; i < num_threads; i++) {
-        futures[i].join();
+        pthread_join(threads[i], NULL);
+        pthread_attr_destroy(&thread_attrs[i]);
     }
     
     // Compute percentiles on duration_us
@@ -370,9 +393,13 @@ void run_benchmark(Options *app_opts) {
     }
 
     print_percentiles(durations);
+    for (int i=0; i<num_threads; i++) {
+        free(trace_array_ptrs[i]);
+    }
 }
 
 int main(int argc, char **argv) {
+    printf("Main thread running on cpu %d\n", sched_getcpu());
     int rc;
     struct spdk_env_opts spdk_opts;
     Options app_opts = parse_args(argc, argv);
