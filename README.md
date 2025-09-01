@@ -1,6 +1,6 @@
 # IO Microbenchmark
 
-A Rust-based microbenchmark for comparing sequential read performance between different IO engines: io_uring (with io polling and kernel polling) and POSIX (O_DIRECT enabled).
+A microbenchmark for comparing sequential read performance between different IO engines: io_uring (with io polling and kernel polling), SPDK, and POSIX (O_DIRECT enabled). The primary objective is to identify software overheads in the IO submission path, particularly those associated with the kernel block layer.
 
 ## Prerequisites
 
