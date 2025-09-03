@@ -3,10 +3,10 @@
 set -euo pipefail
 
 print_usage() {
-    echo "Usage: $0 -t <transport_id> -n <num_threads> -f <num_files> -s <file_size> [options]" >&2
+    echo "Usage: $0 -t <transport_id> -n <num_threads> -f <num_files> -s <file_size> -c <chunk_size> [options]" >&2
     echo "Options:" >&2
     echo "  -C <cmake_args>     Extra CMake args (e.g., -DSPDK_DIR=/opt/spdk)" >&2
-    echo "  -p <profiler>       Profiler: stat|record (default: record)" >&2
+    echo "  -p <profiler>       Profiler: stat|record|funclatency (default: record)" >&2
     echo "  -o <perf_output>    Output file for perf record (default: perf.data)" >&2
     echo "  -G <flamegraph_dir> Path to Flamegraph tools dir (default: ./Flamegraph)" >&2
     echo "  -O <svg_output>     Output SVG path (default: flamegraph.svg)" >&2
@@ -19,14 +19,16 @@ TRANSPORT_ID=""
 NUM_THREADS=""
 NUM_FILES=""
 FILE_SIZE=""
+CHUNK_SIZE=""
 PROFILER="record"
 PERF_OUT="perf.data"
 FLAMEGRAPH_DIR="../FlameGraph"
 FLAMEGRAPH_OUT="flamegraph.svg"
 
-while getopts ":C:t:n:f:s:p:o:G:O:h" opt; do
+while getopts ":C:c:t:n:f:s:p:o:G:O:h" opt; do
   case ${opt} in
     C) CMAKE_ARGS=${OPTARG} ;;
+    c) CHUNK_SIZE=${OPTARG} ;;
     t) TRANSPORT_ID=${OPTARG} ;;
     n) NUM_THREADS=${OPTARG} ;;
     f) NUM_FILES=${OPTARG} ;;
@@ -56,7 +58,8 @@ CMD=("$BIN" \
   --transport_id "$TRANSPORT_ID" \
   --num_threads "$NUM_THREADS" \
   --num_files "$NUM_FILES" \
-  --file_size "$FILE_SIZE")
+  --file_size "$FILE_SIZE" \
+  --io_chunk_size "$CHUNK_SIZE")
 
 echo "Running: ${CMD[*]}" >&2
 
@@ -78,6 +81,16 @@ case "$PROFILER" in
     fi
     echo "Generating Flamegraph SVG -> $FLAMEGRAPH_OUT" >&2
     perf script | perl "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" | perl "$FLAMEGRAPH_DIR/flamegraph.pl" > "$FLAMEGRAPH_OUT"
+    ;;
+  funclatency)
+    sudo /usr/sbin/funclatency-bpfcc "$BIN":spdk_nvme_ns_cmd_read --microseconds --duration 10 &
+    FUNC_LATENCY_PID=$!
+    "${CMD[@]}" &
+    MICROBENCH_PID=$!
+    
+    wait $MICROBENCH_PID
+    wait $FUNC_LATENCY_PID
+    exit 0
     ;;
   *)
     echo "Error: unknown profiler '$PROFILER' (use 'stat' or 'record')" >&2

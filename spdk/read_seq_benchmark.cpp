@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
+#include <spdk/nvme_spec.h>
 #include <spdk/string.h>
 #include <spdk/log.h>
 #include <rte_errno.h>
@@ -29,10 +30,6 @@
 
 #define CACHE_LINE_SIZE 64
 
-/**
-TODO():
-- Investigate why threads are launched on the same core
-*/
 
 struct ControllerInfo {
     struct spdk_nvme_ns *ns;
@@ -65,15 +62,17 @@ struct Options {
     uint32_t num_files;
     
     uint64_t file_size_bytes;
+    
+    uint64_t io_chunk_size_bytes;
 
     ControllerInfo controller_info;
 
     uint32_t transfers_per_file() {
-        return std::max(1ul, file_size_bytes / controller_info.max_io_xfer_size);
+        return std::max(1ul, file_size_bytes / io_chunk_size_bytes);
     }
 
     uint32_t lba_per_transfer() {
-        return std::min(controller_info.max_io_xfer_size, file_size_bytes) / controller_info.sector_size;
+        return std::min(io_chunk_size_bytes, file_size_bytes) / controller_info.sector_size;
     }
 } __attribute__((aligned(CACHE_LINE_SIZE)));
 
@@ -135,6 +134,7 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
     bool should_terminate = false;
     pthread_barrier_wait(start_point);
 
+    printf("Thread %d running on cpu %d\n", thread_id, cpuid);
     auto start_time = std::chrono::system_clock::now();
     bool resubmit = false;
     void *payload = NULL;
@@ -173,6 +173,14 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
     spdk_nvme_ctrlr_free_io_qpair(qpair);
 
     printf("Thread %d took %ld ms\n", thread_id, duration);
+    
+    // Calculate and print effective bandwidth
+    uint64_t total_bytes_read = (uint64_t)total_submissions * opts->io_chunk_size_bytes;
+    double duration_seconds = duration / 1000.0;
+    double bandwidth_mbps = (total_bytes_read / (1024.0 * 1024.0)) / duration_seconds;
+    printf("Thread %d effective bandwidth: %.2f MB/s (%.2f GB/s)\n", 
+           thread_id, bandwidth_mbps, bandwidth_mbps / 1024.0);
+    
 }
 
 static uint64_t parse_iec_size(const char *text)
@@ -214,9 +222,10 @@ void usage(const char *program_name) {
     printf("  -n, --num_threads <n>    Number of threads to use\n");
     printf("  -f, --num_files <n>  Number of files (or targets) to use\n");
     printf("  -s, --file_size <size>   File size in IEC units (e.g., 512KiB, 2MiB, 1GiB)\n");
+    printf("  -c, --io_chunk_size <size> IO chunk size in IEC units (e.g., 4KiB, 64KiB, 1MiB)\n");
     printf("  -h                   Show this help message\n");
     printf("\nExample:\n");
-    printf("  %s --transport_id 0000:01:00.0 --num_threads 2 --num_files 4 --file_size 1GiB\n", program_name);
+    printf("  %s --transport_id 0000:01:00.0 --num_threads 2 --num_files 4 --file_size 1GiB --io_chunk_size 64KiB\n", program_name);
 }
 
 Options parse_args(int argc, char **argv) {
@@ -227,11 +236,12 @@ Options parse_args(int argc, char **argv) {
         {"num_threads", required_argument, 0, 'n'},
         {"num_files", required_argument, 0, 'f'},
         {"file_size", required_argument, 0, 's'},
+        {"io_chunk_size", required_argument, 0, 'c'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "t:n:f:s:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:n:f:s:c:h", long_options, NULL)) != -1) {
         switch (opt) {
         case 't':
             opts.transport_id = optarg;
@@ -252,6 +262,16 @@ Options parse_args(int argc, char **argv) {
             opts.file_size_bytes = size;
             break;
         }
+        case 'c': {
+            uint64_t size = parse_iec_size(optarg);
+            if (size == 0) {
+                fprintf(stderr, "Invalid --io_chunk_size value: %s\n", optarg);
+                usage(argv[0]);
+                exit(1);
+            }
+            opts.io_chunk_size_bytes = size;
+            break;
+        }
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -265,6 +285,17 @@ Options parse_args(int argc, char **argv) {
         usage(argv[0]);
         exit(1);
     }
+
+    if (opts.file_size_bytes % opts.io_chunk_size_bytes != 0) {
+        fprintf(stderr, "Error: File size (%lu bytes) must be a multiple of IO chunk size (%lu bytes)\n", opts.file_size_bytes, opts.io_chunk_size_bytes);
+        exit(1);
+    }
+    
+    // Set default IO chunk size if not provided
+    if (opts.io_chunk_size_bytes == 0) {
+        opts.io_chunk_size_bytes = 64 * 1024; // Default to 64KB
+    }
+    
     return opts;
 }
 
@@ -274,6 +305,52 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 {
 	printf("Attaching to %s\n", trid->traddr);
 	return true;
+}
+
+void admin_cmd_complete_cb(void *arg, const struct spdk_nvme_cpl *completion) {
+    if (spdk_nvme_cpl_is_error(completion)) {
+        const char *err_msg = spdk_nvme_cpl_get_status_string(&completion->status);
+        printf("Failed to set power mode: %s\n", err_msg);
+        exit(1);
+    }
+}
+
+// void get_power_mode_cb(void *arg, const struct spdk_nvme_cpl *completion) {
+//     if (spdk_nvme_cpl_is_error(completion)) {
+//         const char *err_msg = spdk_nvme_cpl_get_status_string(&completion->status);
+//         printf("Failed to get power mode: %s\n", err_msg);
+//         exit(1);
+//     }
+//     printf("Power mode: %d\n", completion->cdw0);
+// }
+
+// void print_power_mode(struct spdk_nvme_ctrlr *ctrlr) {
+//     int ret = spdk_nvme_ctrlr_cmd_get_feature(ctrlr, SPDK_NVME_FEAT_POWER_MANAGEMENT, 
+//         0, NULL, 0, get_power_mode_cb, NULL);
+//     if (ret != 0) {
+//         printf("Failed to get power mode\n");
+//         exit(1);
+//     }
+//     int completed = 0;
+//     while (completed == 0) {
+//         completed = spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+//     }
+// }
+
+void set_power_mode(struct spdk_nvme_ctrlr *ctrlr) {
+    spdk_nvme_feat_power_management cdw11;
+    cdw11.bits.ps = 0;   // Maximum performance
+    cdw11.bits.wh = 1;
+    cdw11.bits.reserved = 0;
+
+    int ret = spdk_nvme_ctrlr_cmd_set_feature(ctrlr, SPDK_NVME_FEAT_POWER_MANAGEMENT, cdw11.raw, 0, NULL, 0, admin_cmd_complete_cb, NULL);
+    if (ret != 0) {
+        printf("Failed to set power mode\n");
+    }
+    int completed = 0;
+    while (completed == 0) {
+        completed = spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+    }
 }
 
 static void
@@ -286,6 +363,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	int nsid;
 	struct spdk_nvme_ns *ns;
 	printf("Attached to %s\n", trid->traddr);
+
+    set_power_mode(ctrlr);
 
 	opts->controller_info.controller_data = spdk_nvme_ctrlr_get_data(ctrlr);
     opts->controller_info.controller = ctrlr;
@@ -306,6 +385,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	        spdk_nvme_ns_get_size(ns) / 1000000000,
             cap_reg.bits.mqes,
             spdk_nvme_ns_get_max_io_xfer_size(ns)/1024);
+
+        // Validate IO chunk size
+        if (opts->io_chunk_size_bytes > opts->controller_info.max_io_xfer_size) {
+            fprintf(stderr, "Error: IO chunk size (%lu bytes) exceeds maximum transfer size (%zu bytes)\n",
+                    opts->io_chunk_size_bytes, opts->controller_info.max_io_xfer_size);
+            exit(1);
+        }
 
         printf("=============\n");
         break;
@@ -427,13 +513,13 @@ int main(int argc, char **argv) {
         printf("spdk_nvme_probe failed.\n");
         return 1;
     }
-    printf("Num files: %d\nFile size: %ld\nNum threads: %d\n", app_opts.num_files, app_opts.file_size_bytes, app_opts.num_threads);
+    printf("Num files: %d\nFile size: %ld\nNum threads: %d\nIO chunk size: %ld\n", app_opts.num_files, app_opts.file_size_bytes, app_opts.num_threads, app_opts.io_chunk_size_bytes);
     // Pre-allocate memory in a pool
     uint32_t cache_size = 0;
     if (app_opts.num_threads > 1) {
         cache_size = app_opts.num_files / app_opts.num_threads;
     }
-    mempool = spdk_mempool_create("benchmarking", app_opts.num_files, app_opts.file_size_bytes, cache_size, SPDK_ENV_NUMA_ID_ANY);
+    mempool = spdk_mempool_create("benchmarking", app_opts.num_files * app_opts.transfers_per_file(), app_opts.io_chunk_size_bytes, cache_size, SPDK_ENV_NUMA_ID_ANY);
     if (mempool == NULL) {
         std::error_code ec(rte_errno, std::generic_category());
         printf("Failed to create SPDK mempool: %d\n", rte_errno);
