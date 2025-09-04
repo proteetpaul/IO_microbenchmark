@@ -76,6 +76,10 @@ struct Options {
     }
 } __attribute__((aligned(CACHE_LINE_SIZE)));
 
+// struct WorkerCtx {
+
+// } __attribute__((aligned(CACHE_LINE_SIZE)));
+
 struct spdk_mempool *mempool;
 
 static const uint32_t ALIGNMENT = 4096;
@@ -116,7 +120,7 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
     );
 
     // Set capacity of IO queues to max possible value (default is 1024)
-    qpair_opts.io_queue_size = controller_info.mqe + 1;
+    qpair_opts.io_queue_size = 32;
 
     struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(
         controller_info.controller,
@@ -181,6 +185,119 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
     printf("Thread %d effective bandwidth: %.2f MB/s (%.2f GB/s)\n", 
            thread_id, bandwidth_mbps, bandwidth_mbps / 1024.0);
     
+}
+
+struct CompletionCtx {
+    uint64_t *current_lba;
+    uint32_t lba_count;
+    std::chrono::time_point<std::chrono::system_clock> start;
+    uint64_t *max_duration_us;
+    uint64_t buffer_idx;
+    void **payload_buffers;
+    struct spdk_nvme_ns *ns;
+    struct spdk_nvme_qpair *qpair;
+};
+
+void duration_benchmark_read_complete(void *arg, const struct spdk_nvme_cpl *completion) {
+    if (spdk_nvme_cpl_is_error(completion)) {
+        printf("Completion error: %s", spdk_nvme_cpl_get_status_string(&completion->status));
+    }
+    CompletionCtx *ctx = (CompletionCtx *)arg;
+    int ret = spdk_nvme_ns_cmd_read(ctx->ns, ctx->qpair, ctx->payload_buffers[ctx->buffer_idx], 
+        *(ctx->current_lba), ctx->lba_count, duration_benchmark_read_complete, (void*)ctx, 0); 
+    *(ctx->current_lba) += ctx->lba_count;
+    if (ret < 0) {
+        printf("Failed to submit IO\n");
+        exit(1);
+    }
+}
+
+void run_duration_benchmark(Options *opts, uint32_t thread_id, 
+        pthread_barrier_t *start_point) {
+    int cpuid = sched_getcpu();
+    printf("Thread %d running on cpu %d\n", thread_id, cpuid);
+    
+    char thread_name[20];
+    snprintf(thread_name, 20, "spdk-worker-%d", thread_id);
+    pthread_setname_np(pthread_self(), thread_name);
+
+    const uint32_t lba_count = opts->lba_per_transfer();
+    uint32_t queue_depth = 128;
+    auto controller_info = opts->controller_info;
+
+    uint64_t tick_rate = spdk_get_ticks_hz();
+
+    struct spdk_nvme_io_qpair_opts qpair_opts;
+    spdk_nvme_ctrlr_get_default_io_qpair_opts(controller_info.controller, 
+        &qpair_opts,
+        sizeof(struct spdk_nvme_io_qpair_opts)
+    );
+    uint32_t print_period_ms = 100;
+    qpair_opts.io_queue_size = queue_depth;
+    struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(
+        controller_info.controller,
+        &qpair_opts,
+        sizeof(struct spdk_nvme_io_qpair_opts)
+    );
+    if (qpair == NULL) {
+        printf("Failed to create queue pair\n");
+        exit(1);
+    }
+    uint64_t current_lba = 0ll;
+    void **payload_buffers = (void **) malloc(sizeof(void*) * queue_depth);
+    for (int i=0; i<queue_depth; i++) {
+        payload_buffers[i] = spdk_mempool_get(mempool);
+    }
+
+    pthread_barrier_wait(start_point);
+
+    // Submit initial IOs
+    for (int i=0; i<queue_depth; i++) {
+        CompletionCtx *ctx = new CompletionCtx;
+        ctx->buffer_idx = i;
+        ctx->payload_buffers = payload_buffers;
+        ctx->current_lba = &current_lba;
+        ctx->lba_count = lba_count;
+        ctx->ns = controller_info.ns;
+        ctx->qpair = qpair;
+        int ret = spdk_nvme_ns_cmd_read(controller_info.ns, qpair, payload_buffers[i], 
+            current_lba, lba_count, duration_benchmark_read_complete, (void*)ctx, 0);
+        if (ret < 0) {
+            printf("Failed to submit IO\n");
+            exit(1);
+        }
+        current_lba += lba_count;
+    }
+    auto current_tick = spdk_get_ticks();
+    uint64_t duration_seconds = 5;
+    auto end_tick = current_tick + duration_seconds * tick_rate;
+    auto next_print_tick = current_tick + (tick_rate * print_period_ms) / 1000; // Print every 100 ms
+    uint64_t completed = 0;
+    uint64_t last_period_completed = 0;
+    while (current_tick < end_tick) {
+        // auto start_tick = spdk_get_ticks();
+        completed += spdk_nvme_qpair_process_completions(qpair, 1);
+        current_tick = spdk_get_ticks();
+
+        if (current_tick >= next_print_tick) {
+            // print
+            double iops = (completed - last_period_completed) * 1000.0/print_period_ms;
+            double bw_mbps = (iops * opts->io_chunk_size_bytes) / (1024 * 1024);
+            printf("IOPS: %0.2f, Bandwidth: %0.2f MBps\n", iops, bw_mbps);
+            next_print_tick = current_tick + (tick_rate * print_period_ms) / 1000;
+            last_period_completed = completed;
+            current_tick = spdk_get_ticks();
+        }
+        if (current_tick >= end_tick) {
+            break;
+        }
+    }
+
+    uint32_t drained = 0;
+    while (drained < queue_depth) {
+        drained += spdk_nvme_qpair_process_completions(qpair, 0);
+    }
+    spdk_nvme_ctrlr_free_io_qpair(qpair);
 }
 
 static uint64_t parse_iec_size(const char *text)
@@ -423,26 +540,28 @@ void print_percentiles(std::vector<uint64_t> &durations) {
 }
 
 void run_benchmark(Options *app_opts) {
+    uint32_t main_thread_cpu = sched_getcpu();
     uint32_t num_threads = app_opts->num_threads;
     pthread_barrier_t start_barrier;
     pthread_barrier_init(&start_barrier, NULL, num_threads);
     
     // Create CPU masks for each thread to ensure they run on different cores
-    std::vector<cpu_set_t> cpu_masks(num_threads);
-    for (uint32_t i = 0; i < num_threads; i++) {
+    std::vector<cpu_set_t> cpu_masks(num_threads-1);
+    for (uint32_t i = 0; i < num_threads-1; i++) {
+        if (i == main_thread_cpu) continue;
         CPU_ZERO(&cpu_masks[i]);
         CPU_SET(i, &cpu_masks[i]);  // Assign thread i to CPU core i
     }
     
-    uint32_t submissions_per_thread = app_opts->transfers_per_file() * app_opts->num_files / num_threads;
-    uint64_t trace_chunk_size = sizeof(struct IOTrace) * submissions_per_thread;
-    uint64_t padding = CACHE_LINE_SIZE - trace_chunk_size % CACHE_LINE_SIZE;
-    trace_chunk_size += padding;
-    std::vector<IOTrace*> trace_array_ptrs(num_threads);
+    // uint32_t submissions_per_thread = app_opts->transfers_per_file() * app_opts->num_files / num_threads;
+    // uint64_t trace_chunk_size = sizeof(struct IOTrace) * submissions_per_thread;
+    // uint64_t padding = CACHE_LINE_SIZE - trace_chunk_size % CACHE_LINE_SIZE;
+    // trace_chunk_size += padding;
+    // std::vector<IOTrace*> trace_array_ptrs(num_threads);
 
-    for (int i=0; i<num_threads; i++) {
-        trace_array_ptrs[i] = (IOTrace *) aligned_alloc(CACHE_LINE_SIZE, trace_chunk_size * num_threads);
-    }
+    // for (int i=0; i<num_threads; i++) {
+    //     trace_array_ptrs[i] = (IOTrace *) aligned_alloc(CACHE_LINE_SIZE, trace_chunk_size * num_threads);
+    // }
 
     std::vector<pthread_t> threads(num_threads);
     std::vector<pthread_attr_t> thread_attrs(num_threads);
@@ -453,13 +572,16 @@ void run_benchmark(Options *app_opts) {
         
         pthread_create(&threads[i], &thread_attrs[i], 
             [](void *arg) -> void* {
-                auto *args = static_cast<std::tuple<Options*, uint32_t, pthread_barrier_t*, IOTrace*>*>(arg);
-                run_single_threaded_benchmark(std::get<0>(*args), std::get<1>(*args), 
-                                            std::get<2>(*args), std::get<3>(*args));
+                auto *args = static_cast<std::tuple<Options*, uint32_t, pthread_barrier_t*>*>(arg);
+                // run_single_threaded_benchmark(std::get<0>(*args), std::get<1>(*args), 
+                //                             std::get<2>(*args), std::get<3>(*args));
+                run_duration_benchmark(std::get<0>(*args), std::get<1>(*args), 
+                                            std::get<2>(*args));
                 delete args;
                 return NULL;
             },
-            new std::tuple<Options*, uint32_t, pthread_barrier_t*, IOTrace*>(app_opts, i, &start_barrier, trace_array_ptrs[i])
+            // new std::tuple<Options*, uint32_t, pthread_barrier_t*, IOTrace*>(app_opts, i, &start_barrier, trace_array_ptrs[i])
+            new std::tuple<Options*, uint32_t, pthread_barrier_t*>(app_opts, i, &start_barrier)
         );
     }
 
@@ -469,23 +591,22 @@ void run_benchmark(Options *app_opts) {
     }
     
     // Compute percentiles on duration_us
-    std::vector<uint64_t> durations;
-    durations.reserve(submissions_per_thread * num_threads);
-    uint32_t offset = 0;
-    for (int i=0; i<num_threads; i++) {
-        for (int j=0; j<submissions_per_thread; j++) {
-            durations.push_back(trace_array_ptrs[i][j].duration_us);
-        }
-    }
+    // std::vector<uint64_t> durations;
+    // durations.reserve(submissions_per_thread * num_threads);
+    // uint32_t offset = 0;
+    // for (int i=0; i<num_threads; i++) {
+    //     for (int j=0; j<submissions_per_thread; j++) {
+    //         durations.push_back(trace_array_ptrs[i][j].duration_us);
+    //     }
+    // }
 
-    print_percentiles(durations);
-    for (int i=0; i<num_threads; i++) {
-        free(trace_array_ptrs[i]);
-    }
+    // print_percentiles(durations);
+    // for (int i=0; i<num_threads; i++) {
+    //     free(trace_array_ptrs[i]);
+    // }
 }
 
 int main(int argc, char **argv) {
-    printf("Main thread running on cpu %d\n", sched_getcpu());
     int rc;
     struct spdk_env_opts spdk_opts;
     Options app_opts = parse_args(argc, argv);
