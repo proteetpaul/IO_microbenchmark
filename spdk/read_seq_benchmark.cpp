@@ -158,7 +158,7 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
             }
             traces[num_submissions].start = std::chrono::system_clock::now();
             num_submissions++;
-            current_lba += transfers_per_file;
+            current_lba += lba_count;
         }
 
         completed += spdk_nvme_qpair_process_completions(qpair, 0);
