@@ -4,15 +4,16 @@
 
 # Usage message
 usage() {
-  echo "Usage: $0 --engine uring|posix --num-files N --file-size SIZE --num-threads N --chunk-size SIZE --dir DIR [--extra-args '...']"
-  echo "Example: $0 --engine uring --num-files 4 --file-size 1G --num-threads 4 --chunk-size 4096 --dir tmp/bench"
+  echo "Usage: $0 --engine uring|posix --num-files N --file-size SIZE --num-threads N --chunk-size SIZE --dir DIR [--profile] [--extra-args '...']"
+  echo "Example: $0 --engine uring --num-files 4 --file-size 1G --num-threads 4 --chunk-size 4096 --dir tmp/bench --profile"
   exit 1
 }
 
 # Default values
 CHUNK_SIZE=4096
-DIR="tmp"
+DIR="/mnt/ext4_fs/work_dir"
 EXTRA_ARGS=""
+PROFILE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
     --num-threads) NUM_THREADS="$2"; shift 2 ;;
     --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
     --dir) DIR="$2"; shift 2 ;;
+    --profile) PROFILE=true; shift ;;
     --extra-args) EXTRA_ARGS="$2"; shift 2 ;;
     *) usage ;;
   esac
@@ -55,7 +57,7 @@ for i in $(seq 0 $((NUM_FILES-1))); do
   FILE_LIST="$FILE_LIST $DIR/file${i}_${FILE_SIZE}.dat"
 done
 
-sudo /usr/sbin/biosnoop-bpfcc -Q > biosnoop.txt 2>&1 &
+sudo /usr/sbin/biosnoop-bpfcc -d /dev/nvme0n1p4 -Q > biosnoop.txt 2>&1 &
 BIO_PID=$!
 # Wait for 10 seconds to let the bio latency tool jit compilation finish
 sleep 10
@@ -75,30 +77,39 @@ env RUST_LOG=info RUST_BACKTRACE=full cargo run --release --bin microbench_seque
   $EXTRA_ARGS &
 MICROBENCH_PID=$!
 
-# Only benchmark kernel code, 1000 Hz, generate profile output in folded format for flamegraph generation
-echo "Starting profiler for PID $MICROBENCH_PID..."
-sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=40000 > profile_output.txt &
-# profile-cache-misses-bpfcc uses the same logic as profile-bpfcc, except that it samples cache misses instead of the software timer
-# --count determines the sampling period (count=x means sample 1 out of x cache misses)
-sudo ./profile-cache-misses-bpfcc --count 1000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=40000 > cache_miss_output.txt &
-PROFILE_PID=$!
-sudo /usr/sbin/funclatency-bpfcc blk_mq_start_request --microseconds --pid $MICROBENCH_PID --duration 20 &
+sudo /usr/sbin/funclatency-bpfcc nvme_pci_complete_batch --microseconds --pid $MICROBENCH_PID --duration 20 &
 FUNC_LATENCY_PID=$!
+
+# Only benchmark kernel code, 1000 Hz, generate profile output in folded format for flamegraph generation
+if [[ "$PROFILE" == "true" ]]; then
+  echo "Starting profiler for PID $MICROBENCH_PID..."
+  sudo /usr/sbin/profile-bpfcc -F 10000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=40000 > profile_output.txt &
+  # profile-cache-misses-bpfcc uses the same logic as profile-bpfcc, except that it samples cache misses instead of the software timer
+  # --count determines the sampling period (count=x means sample 1 out of x cache misses)
+  # sudo ./profile-cache-misses-bpfcc --count 1000 --pid $MICROBENCH_PID -K -f -d 15 --stack-storage-size=40000 > cache_miss_output.txt &
+  PROFILE_PID=$!  
+else
+  PROFILE_PID=""
+fi
 
 wait $MICROBENCH_PID
 # python3 parse_interrupts.py
 
-echo "Microbenchmark completed... Stopping profiler and biosnoop..."
+echo "Microbenchmark completed... Stopping biosnoop..."
 sudo kill -SIGINT $BIO_PID
-sudo kill -SIGINT $PROFILE_PID
-wait $PROFILE_PID
-wait $FUNC_LATENCY_PID
+
+if [[ "$PROFILE" == "true" ]]; then
+  echo "Stopping profiler..."
+  sudo kill -SIGINT $PROFILE_PID
+  wait $PROFILE_PID
+
+  ../FlameGraph/flamegraph.pl --title="Flame Graph for IO" profile_output.txt > flamegraph_128K.svg
+  # ../FlameGraph/flamegraph.pl --title="Flame Graph for IO" cache_miss_output.txt > flamegraph_128K_cache.svg
+fi
 
 sync biosnoop.txt
+python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type block_device
 
-python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type total
-
-../FlameGraph/flamegraph.pl --title="Flame Graph for IO" profile_output.txt > flamegraph_128K.svg
-../FlameGraph/flamegraph.pl --title="Flame Graph for IO" cache_miss_output.txt > flamegraph_128K_cache.svg
+wait $FUNC_LATENCY_PID
 echo "Done."
 # rm -rf "$DIR"/
