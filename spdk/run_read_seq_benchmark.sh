@@ -84,12 +84,16 @@ case "$PROFILER" in
     ;;
   funclatency)
     sudo /usr/sbin/funclatency-bpfcc "$BIN":spdk_nvme_ns_cmd_read --microseconds --duration 10 &
-    FUNC_LATENCY_PID=$!
+    FUNC_LATENCY_PID1=$!
+    sudo /usr/sbin/funclatency-bpfcc "$BIN":spdk_nvme_qpair_process_completions --microseconds --duration 10 &
+    FUNC_LATENCY_PID2=$!
+    sleep 2
     "${CMD[@]}" &
     MICROBENCH_PID=$!
     
     wait $MICROBENCH_PID
-    wait $FUNC_LATENCY_PID
+    wait $FUNC_LATENCY_PID1
+    wait $FUNC_LATENCY_PID2
     exit 0
     ;;
   *)

@@ -116,7 +116,7 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
     );
 
     // Set capacity of IO queues to max possible value (default is 1024)
-    qpair_opts.io_queue_size = controller_info.mqe + 1;
+    qpair_opts.io_queue_size = 128;
 
     struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(
         controller_info.controller,
@@ -181,6 +181,9 @@ void run_single_threaded_benchmark(Options *opts, uint32_t thread_id,
     printf("Thread %d effective bandwidth: %.2f MB/s (%.2f GB/s)\n", 
            thread_id, bandwidth_mbps, bandwidth_mbps / 1024.0);
     
+    // Calculate and print IOPs
+    double iops = total_submissions / duration_seconds;
+    printf("Thread %d IOPs: %.2f\n", thread_id, iops);
 }
 
 static uint64_t parse_iec_size(const char *text)
