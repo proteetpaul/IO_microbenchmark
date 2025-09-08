@@ -6,22 +6,24 @@ extern crate libc;
 extern crate io_uring;
 extern crate pprof;
 extern crate clap;
+extern crate log;
 
 use std::fs::{File, OpenOptions};
 use std::os::raw::c_void;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 use std::alloc::{Layout, alloc};
 use io_uring::squeue::Entry;
 use io_uring::{cqueue, opcode, squeue, IoUring};
-use libc::{iovec, posix_fadvise};
+use libc::iovec;
 use pprof::ProfilerGuard;
 use std::sync::{Arc, Barrier};
 use std::sync::mpsc::{self, Receiver};
 use clap::Parser;
+use log::info;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -43,8 +45,12 @@ pub struct Cli {
     pub files: String,
     #[arg(long, default_value_t = true)]
     pub use_fixed_buffers: bool,
+    /// Number of io_uring kernel workers
+    #[arg(long, default_value_t = 1)]
+    pub kernel_workers: usize,
 }
 
+#[allow(dead_code)]
 fn start_flamegraph() -> ProfilerGuard<'static> {
     pprof::ProfilerGuardBuilder::default()
                 .frequency(1000)
@@ -52,6 +58,7 @@ fn start_flamegraph() -> ProfilerGuard<'static> {
                 .unwrap()
 }
 
+#[allow(dead_code)]
 fn stop_flamegraph(profiler: ProfilerGuard, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
     let report = profiler.report().build()?;
     let mut svg_data = Vec::new();
@@ -63,6 +70,7 @@ fn stop_flamegraph(profiler: ProfilerGuard, filename: &str) -> Result<(), Box<dy
 }
 
 fn main() {
+    println!("Main thread running on cpu {}", get_cpu().unwrap());
     std::thread::sleep(std::time::Duration::from_secs(10));
     let cli = Cli::parse();
     let engine = match cli.engine.as_str() {
@@ -70,6 +78,11 @@ fn main() {
         "posix" => IoEngine::PosixODirect,
         _ => panic!("Unknown engine: {}", cli.engine),
     };
+    if cli.num_threads % cli.kernel_workers != 0 {
+        panic!("Number of kernel workers ({}) must divide number of threads ({})", 
+               cli.kernel_workers, cli.num_threads);
+    }
+    
     let files: Vec<std::path::PathBuf> = cli.files
         .split_whitespace()
         .map(PathBuf::from)
@@ -81,6 +94,7 @@ fn main() {
         chunk_size: cli.chunk_size,
         engine,
         use_fixed_buffers: cli.use_fixed_buffers,
+        kernel_workers: cli.kernel_workers,
     };
     
     run_microbench(config);
@@ -94,6 +108,7 @@ pub struct MicrobenchConfig {
     pub chunk_size: usize,
     pub engine: IoEngine,
     pub use_fixed_buffers: bool,
+    pub kernel_workers: usize,
 }
 
 #[derive(Clone)]
@@ -117,38 +132,47 @@ pub struct IoUringThreadpool {
 // Check out ebpf -> get familiar with observability tools (bcc)
 // Start with one single large file 
 impl IoUringThreadpool {
-    const NUM_ENTRIES: u32 = 4096;
+    const NUM_ENTRIES: u32 = 128;
+    const DURATION_MILLIS: u64 = 1000;
     pub const BUFFER_ALIGNMENT: usize = 4096;
 
     pub fn new(files_per_thread: &Vec<Vec<PathBuf>>, config: MicrobenchConfig) -> IoUringThreadpool {
         let (tx, rx) = mpsc::channel();
         let mut workers = Vec::<thread::JoinHandle<()>>::new();
-        let mut first_iter = true;
-        let mut builder = IoUring::<squeue::Entry, cqueue::Entry>::builder();
-        builder.setup_iopoll();
-        builder.setup_sqpoll(50000);
-        // builder.setup_sqpoll_cpu(12);
+        
         let barrier = Arc::new(Barrier::new(files_per_thread.len()));
-        for (thread_id, files) in files_per_thread.iter().enumerate() {
-            let ring = builder
-                .build(Self::NUM_ENTRIES)
-                .expect("Failed to build IoUring instance");
-            if first_iter {
-                builder.setup_attach_wq(ring.as_raw_fd());
-                first_iter = false;
+        let user_to_kernel_worker_ratio = config.num_threads / config.kernel_workers;
+        println!("Number of kernel workers: {}", config.kernel_workers);
+        for i in 0..config.kernel_workers {
+            let mut builder = IoUring::<squeue::Entry, cqueue::Entry>::builder();
+            builder.setup_iopoll();
+            builder.setup_sqpoll(50000);
+            // builder.setup_sqpoll_cpu(get_cpu().unwrap() as u32 + i as u32 + 1);
+
+            let mut first_iter = true;
+            for j in 0..user_to_kernel_worker_ratio {
+                let thread_idx = i * user_to_kernel_worker_ratio + j;
+                let ring = builder
+                    .build(Self::NUM_ENTRIES)
+                    .expect("Failed to build IoUring instance");
+                if first_iter {
+                    builder.setup_attach_wq(ring.as_raw_fd());
+                    first_iter = false;
+                }
+                let files = files_per_thread[thread_idx].clone();
+                let tx = tx.clone();
+                let config_clone = config.clone();
+                let barrier_clone = barrier.clone();
+                let worker = thread::spawn(move || {                
+                    let mut uring_worker = UringWorker::new(ring, files, config_clone);
+                    uring_worker.duration_based_benchmark(barrier_clone);
+                    let timings = uring_worker.get_timings().clone();
+                    tx.send(timings).unwrap();
+                });
+                workers.push(worker);
             }
-            let files = files.clone();
-            let tx = tx.clone();
-            let config_clone = config.clone();
-            let barrier_clone = barrier.clone();
-            let worker = thread::spawn(move || {                
-                let mut uring_worker = UringWorker::new(ring, files, config_clone);
-                uring_worker.thread_loop(barrier_clone);
-                let timings = uring_worker.get_timings().clone();
-                tx.send(timings).unwrap();
-            });
-            workers.push(worker);
         }
+        
         drop(tx);
         IoUringThreadpool { workers, rx}
     }
@@ -169,12 +193,22 @@ struct UringWorker {
     config: MicrobenchConfig,
 }
 
+fn get_cpu() -> Option<i32> {
+    let cpu = unsafe { libc::sched_getcpu() };
+    if cpu == -1 {
+        None // An error occurred
+    } else {
+        Some(cpu)
+    }
+}
+
 impl UringWorker {
     fn new(ring: io_uring::IoUring, file_paths: Vec<PathBuf>, config: MicrobenchConfig) -> UringWorker {
         let mut completions_array = Vec::<usize>::new();
         completions_array.resize(1<<16, 0);
         let tasks = Vec::<Option<IoTask>>::new();
         let timings = vec![(Instant::now(), None); file_paths.len()];
+        info!("Thread running on cpu {}", get_cpu().unwrap());
         
         UringWorker {
             ring,
@@ -194,10 +228,6 @@ impl UringWorker {
             .expect("Failed to open file with O_DIRECT");
         let layout = Layout::from_size_align(self.config.file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
         let base_ptr = unsafe { alloc(layout) };
-        unsafe {
-            let ret = posix_fadvise(file.as_raw_fd(), 0, self.config.file_size as i64, libc::POSIX_FADV_SEQUENTIAL);
-            assert_eq!(ret, 0, "posix_fadvise errored");
-        }
         IoTask {
             base_ptr,
             num_bytes: self.config.file_size,
@@ -223,80 +253,166 @@ impl UringWorker {
         }
     }
 
-    fn thread_loop(&mut self, barrier: Arc<Barrier>) {
-        let mut inflight = 0;
-        let mut file_idx = 0;
-        let num_files = self.file_paths.len();
-        self.create_io_tasks();
-        // barrier.wait();
-        let start_time = Instant::now();
-        while file_idx < num_files || inflight > 0 {
-            // Submit next file if available
-            if file_idx < num_files {
-                let submit_time = Instant::now();
-                let num_chunks = self.submit_reads(file_idx.clone());
-                if num_chunks > 0 {
-                    self.completions_array[file_idx] = num_chunks;
-                    self.timings[file_idx].0 = submit_time;
-                    inflight += 1;
-                    file_idx += 1;
-                }
-            }
-            // Poll completions
-            let completed = self.poll_completions();
+    // #[allow(dead_code)]
+    // fn thread_loop(&mut self, barrier: Arc<Barrier>) {
+    //     let mut inflight = 0;
+    //     let mut file_idx = 0;
+    //     let num_files = self.file_paths.len();
+    //     self.create_io_tasks();
+    //     barrier.wait();
+    //     let start_time = Instant::now();
+    //     while file_idx < num_files || inflight > 0 {
+    //         // Submit next file if available
+    //         if file_idx < num_files {
+    //             let submit_time = Instant::now();
+    //             let num_chunks = self.submit_reads(file_idx.clone());
+    //             if num_chunks > 0 {
+    //                 self.completions_array[file_idx] = num_chunks;
+    //                 self.timings[file_idx].0 = submit_time;
+    //                 inflight += 1;
+    //                 file_idx += 1;
+    //             }
+    //         }
+    //         // Poll completions
+    //         let completed = self.poll_completions();
 
-            inflight -= completed;
+    //         inflight -= completed;
+    //     }
+    //     let end_time = Instant::now();
+    //     let time_ms =  (end_time-start_time).as_millis();
+    //     println!("Time taken: {}", time_ms);
+    //     println!("BW: {:.2} MBps", (self.config.file_size * num_files) as f64 * 1000.0 / (time_ms * 1024 * 1024) as f64);
+    // }
+
+    fn duration_based_benchmark(&mut self, barrier: Arc<Barrier>) {
+        let mut file_idx = 0;
+        let num_chunks = (self.config.file_size + self.config.chunk_size - 1) / self.config.chunk_size;
+        let num_files = self.file_paths.len();
+        assert!(num_files * num_chunks > IoUringThreadpool::NUM_ENTRIES as usize);
+        assert!(IoUringThreadpool::NUM_ENTRIES % num_chunks as u32 == 0);
+
+        self.create_io_tasks();
+        barrier.wait();
+
+        // Submit initial reads
+        let mut reads_submitted = 0;
+        let mut task = self.tasks[file_idx].take();
+        let mut chunk_idx = 0;
+        while reads_submitted < IoUringThreadpool::NUM_ENTRIES {
+            self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
+                file_idx, 
+                (file_idx as u64)<<48, 
+                task.as_ref().unwrap().base_ptr.wrapping_add(self.config.chunk_size * chunk_idx), 
+                chunk_idx as u64
+            );
+            chunk_idx += 1;
+            if chunk_idx == num_chunks {
+                chunk_idx = 0;
+                self.tasks[file_idx] = task.take();
+                file_idx = (file_idx + 1) % num_files;
+                task = self.tasks[file_idx].take();
+                // file_idx += 1;
+            }
+            reads_submitted += 1;
         }
+        
+        let mut total_completions = 0;
+
+        let start_time = Instant::now();
+        loop {
+            let mut num_completions_recvd = self.poll_completions();
+            total_completions += num_completions_recvd;
+            // println!("COmpletions received: {}", total_completions);
+            while num_completions_recvd > 0 {
+                self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
+                    file_idx, 
+                    (file_idx as u64)<<48, 
+                    task.as_ref().unwrap().base_ptr.wrapping_add(self.config.chunk_size * chunk_idx), 
+                    chunk_idx as u64
+                );
+                chunk_idx += 1;
+                if chunk_idx == num_chunks {
+                    chunk_idx = 0;
+                    self.tasks[file_idx] = task.take();
+                    file_idx = (file_idx + 1) % num_files;
+                    task = self.tasks[file_idx].take();
+                }
+                num_completions_recvd -= 1;
+                reads_submitted += 1;
+            }
+
+            let current = Instant::now();
+            if (current-start_time).as_millis() as u64 > IoUringThreadpool::DURATION_MILLIS {
+                break;
+            }
+        }
+
         let end_time = Instant::now();
-        println!("Time taken: {}", (end_time-start_time).as_millis());
+        let time_ms =  (end_time-start_time).as_millis();
+        println!("Completions received: {}", total_completions);
+        println!("Reads submitted: {}", reads_submitted);
+        println!("Time taken: {}", time_ms);
+        println!("BW: {:.2} MBps", (self.config.chunk_size * total_completions) as f64 * 1000.0 / (time_ms * 1024 * 1024) as f64);
+    }
+
+    fn submit_single_read(&mut self, fd: RawFd, file_idx: usize, user_data: u64, ptr: *mut u8, chunk_idx: u64) {
+        let sq = &mut (self.ring.submission());
+        let sqe: Entry;
+        if self.config.use_fixed_buffers {
+            let read_fixed_op = opcode::ReadFixed::new(
+                io_uring::types::Fd(fd),
+                ptr,
+                self.config.chunk_size as _,
+                file_idx as u16,
+            )
+            .offset(chunk_idx * self.config.chunk_size as u64);
+            sqe = read_fixed_op.build().user_data(user_data);
+        } else {
+            let read_op = opcode::Read::new(
+                io_uring::types::Fd(fd),
+                ptr,
+                self.config.chunk_size as _,
+            );
+            sqe = read_op
+                .offset(chunk_idx * self.config.chunk_size as u64)
+                .build()
+                .user_data(user_data);
+        }
+        unsafe {
+            while let Err(_) = sq.push(&sqe) {
+                sq.sync(); // Submit to kernel to make space
+            }
+        }
     }
 
     fn submit_reads(&mut self, file_idx: usize) -> usize {
-        let task = self.tasks[file_idx].as_ref().unwrap();
-        let ring = &mut self.ring;
-        let sq = &mut (ring.submission());
-        let mut buf_ptr = task.base_ptr;
-        let num_chunks = (task.num_bytes + self.config.chunk_size - 1) / self.config.chunk_size;
-        sq.sync();
-        let remaining = sq.capacity() - sq.len();
-        if num_chunks > remaining {
-            return 0;
+        let num_chunks = (self.config.file_size + self.config.chunk_size - 1) / self.config.chunk_size;
+        {
+            let ring = &mut self.ring;
+            let sq = &mut (ring.submission());
+            sq.sync();
+            let remaining = sq.capacity() - sq.len();
+            if num_chunks > remaining {
+                return 0;
+            }
         }
+
+        let task = self.tasks[file_idx].take().unwrap();
+        let mut buf_ptr = task.base_ptr;
         let user_data = (file_idx as u64)<<48;
         for i in 0..num_chunks {
-            let sqe: Entry;
-            if self.config.use_fixed_buffers {
-                let read_fixed_op = opcode::ReadFixed::new(
-                    io_uring::types::Fd(task.file.as_raw_fd()),
-                    task.base_ptr,
-                    self.config.chunk_size as _,
-                    file_idx as u16,
-                )
-                .offset((i * self.config.chunk_size) as u64);
-                sqe = read_fixed_op.build().user_data(user_data + i as u64);
-            } else {
-                let read_op = opcode::Read::new(
-                    io_uring::types::Fd(task.file.as_raw_fd()),
-                    buf_ptr,
-                    self.config.chunk_size as _,
-                );
-                sqe = read_op
-                    .offset((i * self.config.chunk_size) as u64)
-                    .build()
-                    .user_data(user_data + i as u64);
-            }
+            self.submit_single_read(task.file.as_raw_fd(), file_idx, user_data + i as u64, buf_ptr, i as u64);
             unsafe {
-                while let Err(_) = sq.push(&sqe) {
-                    sq.sync(); // Submit to kernel to make space
-                }
                 buf_ptr = buf_ptr.add(self.config.chunk_size);
             }
         }
-        sq.sync();
+        assert!(task.base_ptr != buf_ptr);
+        
+        self.tasks[file_idx] = Some(task);  // Move it back
         num_chunks
     }
 
-    /// Returns number of tasks completed in this poll
+    /// Returns number of completions received in this poll
     fn poll_completions(&mut self) -> usize {
         let cq = &mut self.ring.completion();
         let mut completed = 0;
@@ -304,23 +420,21 @@ impl UringWorker {
             cq.sync();
             match cq.next() {
                 Some(cqe) => {
+                    completed += 1;
                     let errno = -cqe.result();
                     let err = std::io::Error::from_raw_os_error(errno);
-                    if cqe.result() == 0 {
-                        print!("here\n");
-                    }
+                    
                     assert!(
                         cqe.result() == self.config.chunk_size as i32 || cqe.result() == 0,
                         "Read cqe result error: {}", err
                     );
-                    let opcode = (cqe.user_data()>>48) as usize;
-                    let remaining = &mut self.completions_array[opcode];
-                    *remaining -= 1;
-                    if *remaining == 0 {
-                        self.timings[opcode].1 = Some(Instant::now());
-                        completed += 1;
-                        self.tasks[opcode].take();
-                    }
+                    // let opcode = (cqe.user_data()>>48) as usize;
+                    // let remaining = &mut self.completions_array[opcode];
+                    // *remaining -= 1;
+                    // if *remaining == 0 {
+                    //     self.timings[opcode].1 = Some(Instant::now());
+                    //     self.tasks[opcode].take();
+                    // }
                 },
                 None => {
                     break;
@@ -380,7 +494,7 @@ pub fn run_posix_odirect_bench(config: &MicrobenchConfig) {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let mut workers = Vec::new();
-    for (thread_id, files) in files_per_thread.iter().enumerate() {
+    for (_thread_id, files) in files_per_thread.iter().enumerate() {
         let files = files.clone();
         let tx = tx.clone();
         let file_size = config.file_size;
