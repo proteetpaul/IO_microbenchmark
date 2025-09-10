@@ -29,6 +29,7 @@ include_directories(
 link_directories(${SPDK_DIR}/build/lib ${SPDK_DIR}/dpdk/build/lib)
 
 add_executable(spdk_microbenchmark read_seq_benchmark.cpp)
+add_executable(trace_emulation_benchmark trace_emulation_benchmark.cpp)
 
 # Link against SPDK libs you need
 find_package(PkgConfig REQUIRED)
@@ -50,4 +51,10 @@ target_link_libraries(spdk_microbenchmark
     -Wl,--no-whole-archive -Wl,--no-as-needed ${SPDK_ENV_LIBRARIES} 
     -Wl,--as-needed ${SPDK_SYS_LIBS})
 
+target_link_libraries(trace_emulation_benchmark 
+    -Wl,--whole-archive ${SPDK_NVME_LIBRARIES}  
+    -Wl,--no-whole-archive -Wl,--no-as-needed ${SPDK_ENV_LIBRARIES} 
+    -Wl,--as-needed ${SPDK_SYS_LIBS})
+
 target_compile_options(spdk_microbenchmark PRIVATE -g)
+target_compile_options(trace_emulation_benchmark PRIVATE -g)
