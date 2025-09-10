@@ -155,7 +155,7 @@ impl IoUringThreadpool {
                 let ring = builder
                     .build(Self::NUM_ENTRIES)
                     .expect("Failed to build IoUring instance");
-                if first_iter {
+                if first_iter && user_to_kernel_worker_ratio > 1 {
                     builder.setup_attach_wq(ring.as_raw_fd());
                     first_iter = false;
                 }
@@ -186,7 +186,7 @@ pub struct IoTask {
 
 struct UringWorker {
     ring: io_uring::IoUring,
-    completions_array: Vec<usize>,
+    // completions_array: Vec<usize>,
     tasks: Vec<Option<IoTask>>,
     file_paths: Vec<PathBuf>,
     timings: Vec<(Instant, Option<Instant>)>, // (submit_time, completion_time), indexed by file_idx
@@ -212,7 +212,6 @@ impl UringWorker {
         
         UringWorker {
             ring,
-            completions_array,
             tasks,
             file_paths,
             timings,
@@ -288,8 +287,8 @@ impl UringWorker {
         let mut file_idx = 0;
         let num_chunks = (self.config.file_size + self.config.chunk_size - 1) / self.config.chunk_size;
         let num_files = self.file_paths.len();
-        assert!(num_files * num_chunks > IoUringThreadpool::NUM_ENTRIES as usize);
-        assert!(IoUringThreadpool::NUM_ENTRIES % num_chunks as u32 == 0);
+        // assert!(num_files * num_chunks > IoUringThreadpool::NUM_ENTRIES as usize);
+        // assert!(IoUringThreadpool::NUM_ENTRIES % num_chunks as u32 == 0);
 
         self.create_io_tasks();
         barrier.wait();
@@ -298,7 +297,8 @@ impl UringWorker {
         let mut reads_submitted = 0;
         let mut task = self.tasks[file_idx].take();
         let mut chunk_idx = 0;
-        while reads_submitted < IoUringThreadpool::NUM_ENTRIES {
+        let initial_reads_submit = std::cmp::min(num_files * num_chunks, IoUringThreadpool::NUM_ENTRIES as usize);
+        while reads_submitted < initial_reads_submit {
             self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
                 file_idx, 
                 (file_idx as u64)<<48, 
@@ -385,6 +385,7 @@ impl UringWorker {
         }
     }
 
+    #[allow(dead_code)]
     fn submit_reads(&mut self, file_idx: usize) -> usize {
         let num_chunks = (self.config.file_size + self.config.chunk_size - 1) / self.config.chunk_size;
         {

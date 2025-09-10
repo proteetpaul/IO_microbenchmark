@@ -57,7 +57,7 @@ for i in $(seq 0 $((NUM_FILES-1))); do
   FILE_LIST="$FILE_LIST $DIR/file${i}_${FILE_SIZE}.dat"
 done
 
-sudo /usr/sbin/biosnoop-bpfcc -d /dev/nvme0n1p4 -Q > biosnoop.txt 2>&1 &
+sudo /usr/sbin/biosnoop-bpfcc -Q > biosnoop.txt 2>&1 &
 BIO_PID=$!
 # Wait for 10 seconds to let the bio latency tool jit compilation finish
 sleep 10
@@ -96,7 +96,7 @@ wait $MICROBENCH_PID
 # python3 parse_interrupts.py
 
 echo "Microbenchmark completed... Stopping biosnoop..."
-sudo kill -SIGINT $BIO_PID
+sudo kill $BIO_PID
 
 if [[ "$PROFILE" == "true" ]]; then
   echo "Stopping profiler..."
@@ -108,7 +108,8 @@ if [[ "$PROFILE" == "true" ]]; then
 fi
 
 sync biosnoop.txt
-python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type block_device
+TRACE_FILE_NAME="traces/trace_file_${FILE_SIZE}_chunk_${CHUNK_SIZE}.txt"
+python3 parse_bpfcc.py --pid $MICROBENCH_PID --engine $ENGINE --file biosnoop.txt --timing-type block_device --trace-output $TRACE_FILE_NAME
 
 wait $FUNC_LATENCY_PID
 echo "Done."
