@@ -8,8 +8,10 @@ extern crate pprof;
 extern crate clap;
 extern crate log;
 
-use std::fs::{File, OpenOptions};
+use std::ffi::CString;
+use std::fs::OpenOptions;
 use std::os::raw::c_void;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use std::thread;
 use std::time::Instant;
 use std::alloc::{Layout, alloc};
 use io_uring::squeue::Entry;
-use io_uring::{cqueue, opcode, squeue, IoUring};
+use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use libc::iovec;
 use pprof::ProfilerGuard;
 use std::sync::{Arc, Barrier};
@@ -45,6 +47,8 @@ pub struct Cli {
     pub files: String,
     #[arg(long, default_value_t = true)]
     pub use_fixed_buffers: bool,
+    #[arg(long, default_value_t = false)]
+    pub use_fixed_files: bool,
     /// Number of io_uring kernel workers
     #[arg(long, default_value_t = 1)]
     pub kernel_workers: usize,
@@ -94,6 +98,7 @@ fn main() {
         chunk_size: cli.chunk_size,
         engine,
         use_fixed_buffers: cli.use_fixed_buffers,
+        use_fixed_files: cli.use_fixed_files,
         kernel_workers: cli.kernel_workers,
     };
     
@@ -108,6 +113,7 @@ pub struct MicrobenchConfig {
     pub chunk_size: usize,
     pub engine: IoEngine,
     pub use_fixed_buffers: bool,
+    pub use_fixed_files: bool,
     pub kernel_workers: usize,
 }
 
@@ -181,7 +187,7 @@ impl IoUringThreadpool {
 pub struct IoTask {
     pub base_ptr: *mut u8,
     pub num_bytes: usize,
-    pub file: File,
+    pub fd: RawFd,
 }
 
 struct UringWorker {
@@ -219,36 +225,73 @@ impl UringWorker {
         }
     }
 
-    fn create_io_task(&mut self, file_path: &PathBuf) -> IoTask {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(file_path)
-            .expect("Failed to open file with O_DIRECT");
-        let layout = Layout::from_size_align(self.config.file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
-        let base_ptr = unsafe { alloc(layout) };
-        IoTask {
-            base_ptr,
-            num_bytes: self.config.file_size,
-            file,
+    fn submit_open_op(&mut self, file_path: &PathBuf, file_idx: u64) {
+        let bytes = file_path.as_path().as_os_str().as_bytes();
+        let c_path = CString::new(bytes.to_vec()).expect("path contains NUL byte");
+        let open_entry = io_uring::opcode::OpenAt::new(
+            io_uring::types::Fd(libc::AT_FDCWD), c_path.as_ptr()
+            )
+            .mode((libc::O_RDONLY | libc::O_DIRECT) as libc::mode_t)
+            .build()
+            .user_data(file_idx);
+    
+        let sq = &mut (self.ring.submission());
+        unsafe {
+            sq.push(&open_entry).expect("Failed to push open op to sq");
         }
     }
 
     fn create_io_tasks(&mut self) {
         let file_paths = self.file_paths.clone();
+        let mut fds = Vec::<RawFd>::new();
         let mut iovecs = Vec::<libc::iovec>::new();
-        for file_path in file_paths.iter() {
-            let task = self.create_io_task(file_path);
+        for (idx, file_path) in file_paths.iter().enumerate() {
+            self.submit_open_op(file_path, idx as u64);
+            let layout = Layout::from_size_align(self.config.file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
+            let base_ptr = unsafe { alloc(layout) };
+            
             iovecs.push(iovec {
-                iov_base: task.base_ptr as *mut c_void, 
+                iov_base: base_ptr as *mut c_void, 
                 iov_len: self.config.file_size
             });
-            self.tasks.push(Some(task));
         }
+        self.tasks.reserve(file_paths.len());
+
+        {
+            let cq = &mut (self.ring.completion());
+            let mut completed = 0;
+            while completed < file_paths.len() {
+                cq.sync();
+                if cq.next().is_some() {
+                    completed += 1;
+                    let cqe = cq.next().unwrap();
+                    let fd = cqe.result();
+                    let err = std::io::Error::from_raw_os_error(fd);
+                    
+                    assert!(
+                        fd > 0,
+                        "Read cqe result error: {}", err
+                    );
+                    let idx = cqe.user_data();
+                    let task = IoTask {
+                        base_ptr: iovecs[idx as usize].iov_base as *mut u8,
+                        num_bytes: self.config.file_size,
+                        fd: fd as RawFd,
+                    };
+                    fds[idx as usize] = fd as RawFd;
+                    self.tasks[idx as usize] = Some(task);
+                }
+            }
+        }
+
         if self.config.use_fixed_buffers {
             unsafe {
-                let _ = self.ring.submitter().register_buffers(&iovecs);
+                self.ring.submitter().register_buffers(&iovecs).expect("Failed to register buffers");
             }
+        }
+
+        if self.config.use_fixed_files {
+            self.ring.submitter().register_files(&fds).expect("Failed to register files");
         }
     }
 
@@ -299,7 +342,7 @@ impl UringWorker {
         let mut chunk_idx = 0;
         let initial_reads_submit = std::cmp::min(num_files * num_chunks, IoUringThreadpool::NUM_ENTRIES as usize);
         while reads_submitted < initial_reads_submit {
-            self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
+            self.submit_single_read(task.as_ref().unwrap().fd, 
                 file_idx, 
                 (file_idx as u64)<<48, 
                 task.as_ref().unwrap().base_ptr.wrapping_add(self.config.chunk_size * chunk_idx), 
@@ -324,7 +367,7 @@ impl UringWorker {
             total_completions += num_completions_recvd;
             // println!("COmpletions received: {}", total_completions);
             while num_completions_recvd > 0 {
-                self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
+                self.submit_single_read(task.as_ref().unwrap().fd, 
                     file_idx, 
                     (file_idx as u64)<<48, 
                     task.as_ref().unwrap().base_ptr.wrapping_add(self.config.chunk_size * chunk_idx), 
@@ -357,10 +400,15 @@ impl UringWorker {
 
     fn submit_single_read(&mut self, fd: RawFd, file_idx: usize, user_data: u64, ptr: *mut u8, chunk_idx: u64) {
         let sq = &mut (self.ring.submission());
+        let fd = if self.config.use_fixed_files {
+            file_idx as i32
+        } else {
+            fd
+        };
         let sqe: Entry;
         if self.config.use_fixed_buffers {
             let read_fixed_op = opcode::ReadFixed::new(
-                io_uring::types::Fd(fd),
+                types::Fd(fd),
                 ptr,
                 self.config.chunk_size as _,
                 file_idx as u16,
@@ -402,7 +450,7 @@ impl UringWorker {
         let mut buf_ptr = task.base_ptr;
         let user_data = (file_idx as u64)<<48;
         for i in 0..num_chunks {
-            self.submit_single_read(task.file.as_raw_fd(), file_idx, user_data + i as u64, buf_ptr, i as u64);
+            self.submit_single_read(task.fd.as_raw_fd(), file_idx, user_data + i as u64, buf_ptr, i as u64);
             unsafe {
                 buf_ptr = buf_ptr.add(self.config.chunk_size);
             }
