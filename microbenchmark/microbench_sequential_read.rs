@@ -13,7 +13,7 @@ use std::fs::OpenOptions;
 use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
@@ -195,6 +195,7 @@ struct UringWorker {
     // completions_array: Vec<usize>,
     tasks: Vec<Option<IoTask>>,
     file_paths: Vec<PathBuf>,
+    c_paths: Vec<CString>,
     timings: Vec<(Instant, Option<Instant>)>, // (submit_time, completion_time), indexed by file_idx
     config: MicrobenchConfig,
 }
@@ -215,23 +216,29 @@ impl UringWorker {
         let tasks = Vec::<Option<IoTask>>::new();
         let timings = vec![(Instant::now(), None); file_paths.len()];
         info!("Thread running on cpu {}", get_cpu().unwrap());
+        let mut c_paths = Vec::<CString>::new();
+        for file_path in file_paths.iter() {
+            let bytes = file_path.as_path().as_os_str().as_bytes();
+            let c_path = CString::new(bytes.to_vec()).expect("path contains NUL byte");
+            c_paths.push(c_path);
+        }
         
         UringWorker {
             ring,
             tasks,
             file_paths,
+            c_paths,
             timings,
             config,
         }
     }
 
-    fn submit_open_op(&mut self, file_path: &PathBuf, file_idx: u64) {
-        let bytes = file_path.as_path().as_os_str().as_bytes();
-        let c_path = CString::new(bytes.to_vec()).expect("path contains NUL byte");
+    fn submit_open_op(&mut self, file_idx: u64) {
         let open_entry = io_uring::opcode::OpenAt::new(
-            io_uring::types::Fd(libc::AT_FDCWD), c_path.as_ptr()
+            io_uring::types::Fd(libc::AT_EMPTY_PATH), 
+            self.c_paths[file_idx as usize].as_ptr()
             )
-            .mode((libc::O_RDONLY | libc::O_DIRECT) as libc::mode_t)
+            .flags(libc::O_RDONLY | libc::O_DIRECT)
             .build()
             .user_data(file_idx);
     
@@ -242,11 +249,10 @@ impl UringWorker {
     }
 
     fn create_io_tasks(&mut self) {
-        let file_paths = self.file_paths.clone();
         let mut fds = Vec::<RawFd>::new();
         let mut iovecs = Vec::<libc::iovec>::new();
-        for (idx, file_path) in file_paths.iter().enumerate() {
-            self.submit_open_op(file_path, idx as u64);
+        for idx in 0..self.file_paths.len() {
+            self.submit_open_op(idx as u64);
             let layout = Layout::from_size_align(self.config.file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
             let base_ptr = unsafe { alloc(layout) };
             
@@ -255,22 +261,21 @@ impl UringWorker {
                 iov_len: self.config.file_size
             });
         }
-        self.tasks.reserve(file_paths.len());
+        self.tasks.reserve(self.file_paths.len());
 
         {
             let cq = &mut (self.ring.completion());
             let mut completed = 0;
-            while completed < file_paths.len() {
+            while completed < self.file_paths.len() {
                 cq.sync();
-                if cq.next().is_some() {
+                if let Some(cqe) = cq.next() {
                     completed += 1;
-                    let cqe = cq.next().unwrap();
                     let fd = cqe.result();
-                    let err = std::io::Error::from_raw_os_error(fd);
+                    let err = std::io::Error::from_raw_os_error(-fd);
                     
                     assert!(
                         fd > 0,
-                        "Read cqe result error: {}", err
+                        "Read cqe result error: {}, user_data: {}", err, cqe.user_data()
                     );
                     let idx = cqe.user_data();
                     let task = IoTask {
