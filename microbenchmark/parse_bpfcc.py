@@ -29,7 +29,7 @@ def parse_biosnoop(file, pid, engine, timing_type):
         except (ValueError, IndexError):
             continue
         if line_pid == pid:
-            cond = comm.startswith("iou-sqp") if engine == "uring" else comm.startswith("microbench_seq")
+            cond = comm.startswith("iou-wrk") if engine == "uring" else comm.startswith("microbench_seq")
             if cond:
                 if timing_type == "queued":
                     latencies.append(que_ms)

@@ -45,6 +45,8 @@ pub struct Cli {
     pub files: String,
     #[arg(long, default_value_t = true)]
     pub use_fixed_buffers: bool,
+    #[arg(long, default_value_t = true)]
+    pub use_fixed_files: bool,
     /// Number of io_uring kernel workers
     #[arg(long, default_value_t = 1)]
     pub kernel_workers: usize,
@@ -94,6 +96,7 @@ fn main() {
         chunk_size: cli.chunk_size,
         engine,
         use_fixed_buffers: cli.use_fixed_buffers,
+        use_fixed_files: cli.use_fixed_files,
         kernel_workers: cli.kernel_workers,
     };
     
@@ -108,6 +111,7 @@ pub struct MicrobenchConfig {
     pub chunk_size: usize,
     pub engine: IoEngine,
     pub use_fixed_buffers: bool,
+    pub use_fixed_files: bool,
     pub kernel_workers: usize,
 }
 
@@ -147,7 +151,7 @@ impl IoUringThreadpool {
             let mut builder = IoUring::<squeue::Entry, cqueue::Entry>::builder();
             builder.setup_iopoll();
             builder.setup_sqpoll(50000);
-            // builder.setup_sqpoll_cpu(get_cpu().unwrap() as u32 + i as u32 + 1);
+            builder.setup_sqpoll_cpu(get_cpu().unwrap() as u32 + i as u32 + 1);
 
             let mut first_iter = true;
             for j in 0..user_to_kernel_worker_ratio {
@@ -237,18 +241,24 @@ impl UringWorker {
     fn create_io_tasks(&mut self) {
         let file_paths = self.file_paths.clone();
         let mut iovecs = Vec::<libc::iovec>::new();
+        let mut fds = Vec::<RawFd>::new();
         for file_path in file_paths.iter() {
             let task = self.create_io_task(file_path);
             iovecs.push(iovec {
                 iov_base: task.base_ptr as *mut c_void, 
                 iov_len: self.config.file_size
             });
+            fds.push(task.file.as_raw_fd());
             self.tasks.push(Some(task));
         }
         if self.config.use_fixed_buffers {
             unsafe {
                 let _ = self.ring.submitter().register_buffers(&iovecs);
             }
+        }
+
+        if self.config.use_fixed_files {
+            self.ring.submitter().register_files(&fds).expect("Failed to register files");
         }
     }
 
@@ -357,10 +367,15 @@ impl UringWorker {
 
     fn submit_single_read(&mut self, fd: RawFd, file_idx: usize, user_data: u64, ptr: *mut u8, chunk_idx: u64) {
         let sq = &mut (self.ring.submission());
+        // let fd = if self.config.use_fixed_files {
+        //     io_uring::types::Fixed(file_idx)
+        // } else {
+        //     io_uring::types::Fd(fd)
+        // };
         let sqe: Entry;
         if self.config.use_fixed_buffers {
             let read_fixed_op = opcode::ReadFixed::new(
-                io_uring::types::Fd(fd),
+                io_uring::types::Fixed(file_idx as u32),
                 ptr,
                 self.config.chunk_size as _,
                 file_idx as u16,
