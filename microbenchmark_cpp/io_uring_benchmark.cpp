@@ -252,6 +252,7 @@ struct io_uring *create_and_configure_rings(const MicrobenchConfig &config) {
       (struct io_uring *)malloc(config.num_threads * sizeof(struct io_uring));
   for (int i = 0; i < config.num_threads; i++) {
     struct io_uring_params params;
+    memset(&params, 0, sizeof(struct io_uring_params));
     params.flags = IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL;
     if (i > 0) {
       params.flags |= IORING_SETUP_ATTACH_WQ;
