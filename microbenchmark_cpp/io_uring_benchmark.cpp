@@ -95,27 +95,32 @@ private:
 	uint32_t num_files;
 
 	void open_files_and_alloc_buffers() {
+    const size_t num_chunks =
+			(config.file_size + config.chunk_size - 1) / config.chunk_size;
 		fds.resize(file_paths.size());
-		buffers.resize(file_paths.size());
+		buffers.resize(file_paths.size() * num_chunks);
 
-		std::vector<iovec> iovecs(num_files);
+		std::vector<iovec> iovecs(num_files * num_chunks);
 
-		for (size_t i = 0; i < num_files; ++i) {
+		for (uint32_t i = 0; i < num_files; ++i) {
 			fds[i] = open(file_paths[i].c_str(), O_RDONLY | O_DIRECT);
 			if (fds[i] < 0) {
 				throw std::runtime_error("Failed to open file for uring: " +
 										file_paths[i]);
 			}
-			if (posix_memalign(&buffers[i], BUFFER_ALIGNMENT, config.file_size) !=
-				0) {
-				throw std::runtime_error("Failed to allocate aligned memory for uring");
-			}
-			iovecs[i].iov_base = buffers[i];
-			iovecs[i].iov_len = config.file_size;
+      for (uint32_t j=0; j<num_chunks; j++) {
+        uint32_t buffer_idx = i * num_chunks + j;
+        if (posix_memalign(&buffers[buffer_idx], BUFFER_ALIGNMENT, config.file_size) !=
+            0) {
+          throw std::runtime_error("Failed to allocate aligned memory for uring");
+        }
+        iovecs[buffer_idx].iov_base = buffers[buffer_idx];
+			  iovecs[buffer_idx].iov_len = config.chunk_size;
+      }
 		}
 		if (config.use_fixed_buffers) {
 			io_uring_register(ring.ring_fd, IORING_REGISTER_BUFFERS, iovecs.data(),
-							num_files);
+							num_files * num_chunks);
 		}
 		if (config.use_fixed_files) {
 			int ret = io_uring_register(ring.ring_fd, IORING_REGISTER_FILES, fds.data(),
@@ -218,6 +223,8 @@ private:
 	}
 
 	bool submit_single_read(size_t file_idx, size_t chunk_idx) {
+    const size_t num_chunks =
+			(config.file_size + config.chunk_size - 1) / config.chunk_size;
 		struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
 		if (!sqe) {
 			// Should not happen if we only submit after a completion
@@ -225,17 +232,17 @@ private:
 		}
 
 		int fd = fds[file_idx];
-		void *buffer_start = static_cast<char *>(buffers[file_idx]) +
-							(chunk_idx * config.chunk_size);
+    uint32_t buf_idx = file_idx * num_chunks + chunk_idx;
 		off_t offset = chunk_idx * config.chunk_size;
+
 		if (config.use_fixed_buffers) {
 			io_uring_prep_read_fixed(
 				sqe, fd,
-				buffer_start,
+				buffers[buf_idx],
 				config.chunk_size, offset, file_idx);
 		} else {
 			io_uring_prep_read(sqe, fd,
-				buffer_start,
+				buffers[buf_idx],
 				config.chunk_size, offset);
 		}
 		if (config.use_fixed_files) {
