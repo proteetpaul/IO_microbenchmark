@@ -8,6 +8,8 @@ extern crate pprof;
 extern crate clap;
 extern crate log;
 
+use std::collections::VecDeque;
+use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::os::raw::c_void;
 use std::os::unix::fs::OpenOptionsExt;
@@ -182,19 +184,23 @@ impl IoUringThreadpool {
     }
 }
 
+#[derive(Clone)]
 pub struct IoTask {
-    pub base_ptr: *mut u8,
+    pub ptr: *mut u8,
     pub num_bytes: usize,
-    pub file: File,
+    pub file: RawFd,
+    pub buf_id: u16,
+    pub offset: usize,
 }
 
 struct UringWorker {
     ring: io_uring::IoUring,
     // completions_array: Vec<usize>,
-    tasks: Vec<Option<IoTask>>,
+    tasks: Vec<IoTask>,
     file_paths: Vec<PathBuf>,
     timings: Vec<(Instant, Option<Instant>)>, // (submit_time, completion_time), indexed by file_idx
     config: MicrobenchConfig,
+    files: Vec<Arc<File>>,
 }
 
 fn get_cpu() -> Option<i32> {
@@ -210,7 +216,8 @@ impl UringWorker {
     fn new(ring: io_uring::IoUring, file_paths: Vec<PathBuf>, config: MicrobenchConfig) -> UringWorker {
         let mut completions_array = Vec::<usize>::new();
         completions_array.resize(1<<16, 0);
-        let tasks = Vec::<Option<IoTask>>::new();
+        let mut tasks = Vec::new();
+        tasks.reserve(IoUringThreadpool::NUM_ENTRIES as usize);
         let timings = vec![(Instant::now(), None); file_paths.len()];
         info!("Thread running on cpu {}", get_cpu().unwrap());
         
@@ -220,10 +227,11 @@ impl UringWorker {
             file_paths,
             timings,
             config,
+            files: Vec::new(),
         }
     }
 
-    fn create_io_task(&mut self, file_path: &PathBuf) -> IoTask {
+    fn create_io_task(&mut self, file_path: &PathBuf) -> (File, *mut u8) {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
@@ -231,98 +239,62 @@ impl UringWorker {
             .expect("Failed to open file with O_DIRECT");
         let layout = Layout::from_size_align(self.config.file_size, IoUringThreadpool::BUFFER_ALIGNMENT).unwrap();
         let base_ptr = unsafe { alloc(layout) };
-        IoTask {
-            base_ptr,
-            num_bytes: self.config.file_size,
-            file,
-        }
+        (file, base_ptr)
     }
 
     fn create_io_tasks(&mut self) {
         let file_paths = self.file_paths.clone();
         let mut iovecs = Vec::<libc::iovec>::new();
-        let mut fds = Vec::<RawFd>::new();
+        let num_chunks = self.config.file_size / self.config.chunk_size;
+        let mut buf_id = 0;
+
         for file_path in file_paths.iter() {
-            let task = self.create_io_task(file_path);
+            let (file, base_ptr) = self.create_io_task(file_path);
+            let file_arc = Arc::new(file);
             iovecs.push(iovec {
-                iov_base: task.base_ptr as *mut c_void, 
+                iov_base: base_ptr as *mut c_void,
                 iov_len: self.config.file_size
             });
-            fds.push(task.file.as_raw_fd());
-            self.tasks.push(Some(task));
+            for i in 0..num_chunks {
+                let task = IoTask {
+                    ptr: base_ptr.wrapping_add(i * self.config.chunk_size),
+                    num_bytes: self.config.chunk_size,
+                    file: file_arc.as_raw_fd(),
+                    buf_id,
+                    offset: i * self.config.chunk_size,
+                };
+                self.tasks.push(task);
+            }
+            self.files.push(file_arc);
+            buf_id += 1;
         }
         if self.config.use_fixed_buffers {
             unsafe {
                 let _ = self.ring.submitter().register_buffers(&iovecs);
             }
         }
-
-        if self.config.use_fixed_files {
-            self.ring.submitter().register_files(&fds).expect("Failed to register files");
-        }
     }
 
-    // #[allow(dead_code)]
-    // fn thread_loop(&mut self, barrier: Arc<Barrier>) {
-    //     let mut inflight = 0;
-    //     let mut file_idx = 0;
-    //     let num_files = self.file_paths.len();
-    //     self.create_io_tasks();
-    //     barrier.wait();
-    //     let start_time = Instant::now();
-    //     while file_idx < num_files || inflight > 0 {
-    //         // Submit next file if available
-    //         if file_idx < num_files {
-    //             let submit_time = Instant::now();
-    //             let num_chunks = self.submit_reads(file_idx.clone());
-    //             if num_chunks > 0 {
-    //                 self.completions_array[file_idx] = num_chunks;
-    //                 self.timings[file_idx].0 = submit_time;
-    //                 inflight += 1;
-    //                 file_idx += 1;
-    //             }
-    //         }
-    //         // Poll completions
-    //         let completed = self.poll_completions();
-
-    //         inflight -= completed;
-    //     }
-    //     let end_time = Instant::now();
-    //     let time_ms =  (end_time-start_time).as_millis();
-    //     println!("Time taken: {}", time_ms);
-    //     println!("BW: {:.2} MBps", (self.config.file_size * num_files) as f64 * 1000.0 / (time_ms * 1024 * 1024) as f64);
-    // }
-
     fn duration_based_benchmark(&mut self, barrier: Arc<Barrier>) {
-        let mut file_idx = 0;
         let num_chunks = (self.config.file_size + self.config.chunk_size - 1) / self.config.chunk_size;
         let num_files = self.file_paths.len();
-        // assert!(num_files * num_chunks > IoUringThreadpool::NUM_ENTRIES as usize);
-        // assert!(IoUringThreadpool::NUM_ENTRIES % num_chunks as u32 == 0);
+        assert!(num_files * num_chunks > IoUringThreadpool::NUM_ENTRIES as usize);
 
-        self.create_io_tasks();
+        {
+            self.create_io_tasks();
+        }
+        let mut task_queue = VecDeque::<(IoTask, usize)>::new();
+        for i in 0..self.tasks.len() {
+            task_queue.push_back((self.tasks[i].clone(), i));
+        }
         barrier.wait();
 
         // Submit initial reads
         let mut reads_submitted = 0;
-        let mut task = self.tasks[file_idx].take();
-        let mut chunk_idx = 0;
         let initial_reads_submit = std::cmp::min(num_files * num_chunks, IoUringThreadpool::NUM_ENTRIES as usize);
         while reads_submitted < initial_reads_submit {
-            self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
-                file_idx, 
-                (file_idx as u64)<<48, 
-                task.as_ref().unwrap().base_ptr.wrapping_add(self.config.chunk_size * chunk_idx), 
-                chunk_idx as u64
-            );
-            chunk_idx += 1;
-            if chunk_idx == num_chunks {
-                chunk_idx = 0;
-                self.tasks[file_idx] = task.take();
-                file_idx = (file_idx + 1) % num_files;
-                task = self.tasks[file_idx].take();
-                // file_idx += 1;
-            }
+            let (task, idx) = task_queue.pop_front().unwrap();
+            self.submit_single_read(task, idx);
             reads_submitted += 1;
         }
         
@@ -330,24 +302,12 @@ impl UringWorker {
 
         let start_time = Instant::now();
         loop {
-            let mut num_completions_recvd = self.poll_completions();
-            total_completions += num_completions_recvd;
-            // println!("COmpletions received: {}", total_completions);
-            while num_completions_recvd > 0 {
-                self.submit_single_read(task.as_ref().unwrap().file.as_raw_fd(), 
-                    file_idx, 
-                    (file_idx as u64)<<48, 
-                    task.as_ref().unwrap().base_ptr.wrapping_add(self.config.chunk_size * chunk_idx), 
-                    chunk_idx as u64
-                );
-                chunk_idx += 1;
-                if chunk_idx == num_chunks {
-                    chunk_idx = 0;
-                    self.tasks[file_idx] = task.take();
-                    file_idx = (file_idx + 1) % num_files;
-                    task = self.tasks[file_idx].take();
-                }
-                num_completions_recvd -= 1;
+            let num_completions = self.poll_completions(&mut task_queue);
+            total_completions += num_completions;
+
+            while num_completions > 0 {
+                let (task, idx) = task_queue.pop_front().unwrap();
+                self.submit_single_read(task.clone(), idx);
                 reads_submitted += 1;
             }
 
@@ -365,99 +325,60 @@ impl UringWorker {
         println!("BW: {:.2} MBps", (self.config.chunk_size * total_completions) as f64 * 1000.0 / (time_ms * 1024 * 1024) as f64);
     }
 
-    fn submit_single_read(&mut self, fd: RawFd, file_idx: usize, user_data: u64, ptr: *mut u8, chunk_idx: u64) {
-        let sq = &mut (self.ring.submission());
-        // let fd = if self.config.use_fixed_files {
-        //     io_uring::types::Fixed(file_idx)
-        // } else {
-        //     io_uring::types::Fd(fd)
-        // };
+    fn poll_completions(&mut self, task_queue: &mut VecDeque<(IoTask, usize)>) -> usize {
+        let mut num_completions = 0;
+        {
+            self.ring.submit_and_wait(1);
+        }
+        {
+            let cq = &mut self.ring.completion();
+            loop {
+                cq.sync();
+                match cq.next() {
+                    Some(cqe) => {
+                        let task_id = cqe.user_data() as usize;
+                        if cqe.result() != self.config.chunk_size as i32 {
+                            panic!("Read failed");
+                        }
+                        task_queue.push_back((self.tasks[task_id].clone(), task_id));
+                        num_completions += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        num_completions
+    }
+
+    fn submit_single_read(&mut self, task: IoTask, idx: usize) {
         let sqe: Entry;
         if self.config.use_fixed_buffers {
             let read_fixed_op = opcode::ReadFixed::new(
-                io_uring::types::Fixed(file_idx as u32),
-                ptr,
+                io_uring::types::Fixed(task.file.try_into().expect("Failed to convert")),
+                task.ptr,
                 self.config.chunk_size as _,
-                file_idx as u16,
+                task.buf_id as u16,
             )
-            .offset(chunk_idx * self.config.chunk_size as u64);
-            sqe = read_fixed_op.build().user_data(user_data);
+            .offset(task.offset as u64);
+            sqe = read_fixed_op.build().user_data(idx as u64);
         } else {
             let read_op = opcode::Read::new(
-                io_uring::types::Fd(fd),
-                ptr,
+                io_uring::types::Fd(task.file.as_raw_fd()),
+                task.ptr,
                 self.config.chunk_size as _,
             );
             sqe = read_op
-                .offset(chunk_idx * self.config.chunk_size as u64)
+                .offset(task.offset as u64)
                 .build()
-                .user_data(user_data);
+                .user_data(idx as u64);
         }
         unsafe {
+            let sq = &mut (self.ring.submission());
             while let Err(_) = sq.push(&sqe) {
                 sq.sync(); // Submit to kernel to make space
             }
         }
-    }
-
-    #[allow(dead_code)]
-    fn submit_reads(&mut self, file_idx: usize) -> usize {
-        let num_chunks = (self.config.file_size + self.config.chunk_size - 1) / self.config.chunk_size;
-        {
-            let ring = &mut self.ring;
-            let sq = &mut (ring.submission());
-            sq.sync();
-            let remaining = sq.capacity() - sq.len();
-            if num_chunks > remaining {
-                return 0;
-            }
-        }
-
-        let task = self.tasks[file_idx].take().unwrap();
-        let mut buf_ptr = task.base_ptr;
-        let user_data = (file_idx as u64)<<48;
-        for i in 0..num_chunks {
-            self.submit_single_read(task.file.as_raw_fd(), file_idx, user_data + i as u64, buf_ptr, i as u64);
-            unsafe {
-                buf_ptr = buf_ptr.add(self.config.chunk_size);
-            }
-        }
-        assert!(task.base_ptr != buf_ptr);
-        
-        self.tasks[file_idx] = Some(task);  // Move it back
-        num_chunks
-    }
-
-    /// Returns number of completions received in this poll
-    fn poll_completions(&mut self) -> usize {
-        let cq = &mut self.ring.completion();
-        let mut completed = 0;
-        loop {
-            cq.sync();
-            match cq.next() {
-                Some(cqe) => {
-                    completed += 1;
-                    let errno = -cqe.result();
-                    let err = std::io::Error::from_raw_os_error(errno);
-                    
-                    assert!(
-                        cqe.result() == self.config.chunk_size as i32 || cqe.result() == 0,
-                        "Read cqe result error: {}", err
-                    );
-                    // let opcode = (cqe.user_data()>>48) as usize;
-                    // let remaining = &mut self.completions_array[opcode];
-                    // *remaining -= 1;
-                    // if *remaining == 0 {
-                    //     self.timings[opcode].1 = Some(Instant::now());
-                    //     self.tasks[opcode].take();
-                    // }
-                },
-                None => {
-                    break;
-                }
-            }
-        }
-        completed
+        self.ring.submit().expect("Failed to submit");
     }
 
     pub fn get_timings(&self) -> &Vec<(Instant, Option<Instant>)> {
